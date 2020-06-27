@@ -31,7 +31,7 @@ func TestRun2(t *testing.T){
 	webUrl, err := url.Parse("http://8.oldhacker.org/txt/More%20Hacking/")
 	assert.Nil(t, err)
 	client := New(webUrl)
-	client.outputPath = "./output"
+	client.OutputPath = "./output"
 	client.dryRun = true
 
 	err = client.Run()

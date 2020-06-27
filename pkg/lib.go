@@ -1,6 +1,7 @@
 package raria2
 
 import (
+	"bufio"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/sirupsen/logrus"
 	"io"
@@ -8,21 +9,22 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
 
 type RAria2 struct {
 	url                       *url.URL
-	parallelJobs              int
-	parallelConnectionsPerJob int
-	concurrentDownloadsPerJob int
+	ParallelJobs              int
+	ParallelConnectionsPerJob int
+	ConcurrentDownloadsPerJob int
+	OutputPath string
 
 	urlList    []string
 	httpClient *http.Client
-
-	outputPath string
 
 	// does not perform any resource download
 	dryRun bool
@@ -35,9 +37,9 @@ type RAria2 struct {
 func New(url *url.URL) *RAria2 {
 	return &RAria2{
 		url:                       url,
-		parallelJobs:              5,
-		parallelConnectionsPerJob: 5,
-		concurrentDownloadsPerJob: 5,
+		ParallelJobs:              5,
+		ParallelConnectionsPerJob: 5,
+		ConcurrentDownloadsPerJob: 5,
 	}
 }
 
@@ -93,8 +95,8 @@ func (r *RAria2) getLinksByUrl(urlString string) ([]string, error) {
 func (r *RAria2) Run() error {
 
 	// Check that output path exists
-	if _, err := os.Stat(r.outputPath); os.IsNotExist(err) {
-		err = os.Mkdir(r.outputPath, 0755)
+	if _, err := os.Stat(r.OutputPath); os.IsNotExist(err) {
+		err = os.Mkdir(r.OutputPath, 0755)
 		if err != nil {
 			return err
 		}
@@ -108,12 +110,12 @@ func (r *RAria2) Run() error {
 		return err
 	}
 
-	logrus.Infof("got %d URLs: dividing them into %d jobs", len(r.urlList), r.parallelJobs)
+	logrus.Infof("got %d URLs: dividing them into %d jobs", len(r.urlList), r.ParallelJobs)
 
-	jobSplit := int(math.Ceil(float64(float32(len(r.urlList)) / float32(r.parallelJobs))))
+	jobSplit := int(math.Ceil(float64(float32(len(r.urlList)) / float32(r.ParallelJobs))))
 	r.wg = &sync.WaitGroup{}
 
-	for i := 0; i < r.parallelJobs; i++ {
+	for i := 0; i < r.ParallelJobs; i++ {
 		beginIndex := i * jobSplit
 		endIndex := intMin((i+1) * jobSplit, len(r.urlList))
 		if beginIndex > endIndex {
@@ -194,7 +196,7 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 		logrus.Infof("[W %d]: dry run: downloading %s to %s", workerId, cUrl, outputPath)
 	}
 
-	outputDir := filepath.Join(r.outputPath, filepath.Dir(outputPath))
+	outputDir := filepath.Join(r.OutputPath, filepath.Dir(outputPath))
 	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
 		if r.dryRun {
 			logrus.Infof("[W %d]: dry run: creating folder %s", workerId, outputDir)
@@ -205,6 +207,54 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 				return
 			}
 		}
+	}
+
+	binFile := "aria2c"
+	args := []string{"-x", strconv.Itoa(r.ParallelConnectionsPerJob), "-d", outputDir}
+
+	// cmd
+	if r.dryRun {
+		args = append(args, "--dry-run=true")
+	}
+
+	args = append(args, cUrl)
+
+	if r.dryRun {
+		logrus.Infof("cmd: %s %s", binFile, strings.Join(args, " "))
+	}
+
+	cmd := exec.Command(binFile, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		logrus.Warnf("unable to get stdout for subcommand: %v", err)
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		logrus.Warnf("unable to get stderr for subcommand: %v", err)
+		return
+	}
+	stdoutScanner := bufio.NewScanner(stdout)
+	stderrScanner := bufio.NewScanner(stderr)
+
+	err = cmd.Start()
+
+	for stdoutScanner.Scan() {
+		logrus.Infof("[W %d]: %s reports: %v", workerId, binFile, stdoutScanner.Text())
+	}
+
+	for stderrScanner.Scan() {
+		logrus.Warnf("[W %d]: %s reports: %v", workerId, binFile, stderrScanner.Text())
+	}
+
+	if err != nil {
+		logrus.Warnf("unable to run %v: %v", binFile, err)
+	}
+
+	err = cmd.Wait()
+
+	if err != nil {
+		logrus.Warnf("unable to wait %v: %v", binFile, err)
 	}
 }
 

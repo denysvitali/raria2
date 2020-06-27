@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import (
 	"github.com/alexflint/go-arg"
@@ -7,25 +7,26 @@ import (
 	"net/url"
 )
 
-type Arguments struct {
-	url string `name:"url" help:"The URL from where to fetch the resources from"`
+var args struct {
+	Output string `arg:"-o" help:"Output directory"`
+	DryRun bool   `arg:"-d" help:"Dry Run" default:"false"`
+	Url    string `arg:"positional" help:"The URL from where to fetch the resources from"`
 }
 
-var args Arguments
-
-func main(){
+func main() {
 	arg.MustParse(&args)
 
-	if args.url == "" {
+	if args.Url == "" {
 		logrus.Fatal("please provide an URL")
 	}
 
-	parsedUrl, err := url.Parse(args.url)
+	parsedUrl, err := url.Parse(args.Url)
 	if err != nil {
 		logrus.Fatalf("invalid URL provided")
 	}
 
 	client := raria2.New(parsedUrl)
+	client.OutputPath = args.Output
 
 	err = client.Run()
 	if err != nil {
