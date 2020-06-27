@@ -8,9 +8,10 @@ import (
 )
 
 var args struct {
-	Output string `arg:"-o" help:"Output directory"`
-	DryRun bool   `arg:"-d" help:"Dry Run" default:"false"`
-	Url    string `arg:"positional" help:"The URL from where to fetch the resources from"`
+	Output  string `arg:"-o" help:"Output directory"`
+	DryRun  bool   `arg:"-d" help:"Dry Run" default:"false"`
+	Url     string `arg:"positional" help:"The URL from where to fetch the resources from"`
+	Workers int    `arg:"-w" help:"Number of workers" default:"5"`
 }
 
 func main() {
@@ -27,6 +28,11 @@ func main() {
 
 	client := raria2.New(parsedUrl)
 	client.OutputPath = args.Output
+
+	if args.Workers < 1 {
+		logrus.Fatalf("invalid number of workers: %d", args.Workers)
+	}
+	client.ParallelJobs = args.Workers
 
 	err = client.Run()
 	if err != nil {
