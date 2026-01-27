@@ -2,9 +2,11 @@ package raria2
 
 import (
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,6 +25,15 @@ func TestSameUrl(t *testing.T) {
 	assert.False(t, SameUrl(firstUrl, fourthUrl))
 }
 
+func tempDir(t *testing.T) string {
+	dir, err := ioutil.TempDir("", "raria2-test-")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestRun_WithRootFixture(t *testing.T) {
 	ts := newFixtureServer()
 	t.Cleanup(ts.Close)
@@ -30,7 +41,7 @@ func TestRun_WithRootFixture(t *testing.T) {
 	webUrl, err := url.Parse(ts.URL + "/")
 	assert.Nil(t, err)
 	client := New(webUrl)
-	client.OutputPath = t.TempDir()
+	client.OutputPath = tempDir(t)
 	client.dryRun = true
 
 	err = client.Run()
@@ -44,7 +55,7 @@ func TestRun_FromNestedPath(t *testing.T) {
 	webUrl, err := url.Parse(ts.URL + "/more/")
 	assert.Nil(t, err)
 	client := New(webUrl)
-	client.OutputPath = t.TempDir()
+	client.OutputPath = tempDir(t)
 	client.dryRun = true
 	client.MaxConcurrentDownload = 2
 	client.MaxConnectionPerServer = 2
@@ -115,7 +126,7 @@ func newFixtureServer() *httptest.Server {
 
 func TestDownloadResource_ComputesRelativeOutputDir(t *testing.T) {
 	baseURL, _ := url.Parse("https://example.com/root/")
-	outputDir := t.TempDir()
+	outputDir := tempDir(t)
 	r := &RAria2{
 		url:        baseURL,
 		OutputPath: outputDir,
@@ -133,7 +144,7 @@ func TestDownloadResource_ComputesRelativeOutputDir(t *testing.T) {
 
 func TestDownloadResource_ExternalHostFallsBackToHostDir(t *testing.T) {
 	baseURL, _ := url.Parse("https://example.com/root/")
-	outputDir := t.TempDir()
+	outputDir := tempDir(t)
 	r := &RAria2{
 		url:        baseURL,
 		OutputPath: outputDir,
@@ -151,7 +162,7 @@ func TestDownloadResource_ExternalHostFallsBackToHostDir(t *testing.T) {
 
 func TestGetLinks_FiltersNonSubPaths(t *testing.T) {
 	original, _ := url.Parse("https://example.com/root/")
-	body := io.NopCloser(strings.NewReader(`
+	body := ioutil.NopCloser(strings.NewReader(`
 <html><body>
   <a href="https://example.com/root/file1.bin">file1</a>
   <a href="/root/file2.bin">file2</a>
@@ -169,7 +180,7 @@ func TestGetLinks_FiltersNonSubPaths(t *testing.T) {
 
 func TestGetLinks_MirrorNforceFormat(t *testing.T) {
 	base, _ := url.Parse("https://mirror.nforce.com/pub/speedtests/")
-	body := io.NopCloser(strings.NewReader(`
+	body := ioutil.NopCloser(strings.NewReader(`
 <html><body>
   <table>
     <tr><td><a href="10mb.bin">&lt;10mb.bin&gt;</a></td></tr>
@@ -189,7 +200,7 @@ func TestGetLinks_MirrorNforceFormat(t *testing.T) {
 
 func TestGetLinks_CopypartyFormat(t *testing.T) {
 	base, _ := url.Parse("https://a.ocv.me/pub/demo/")
-	body := io.NopCloser(strings.NewReader(`
+	body := ioutil.NopCloser(strings.NewReader(`
 <html><body>
   <table>
     <tr><td>DIR</td><td><a href="docs/">&lt;docs/&gt;</a></td></tr>
