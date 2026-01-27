@@ -9,23 +9,12 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      GO_VERSION: go1.21.6
     steps:
       - uses: actions/checkout@v4
-      - name: Install Go via gvm (binary)
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl git
-          bash < <(curl -s -S -L https://raw.githubusercontent.com/moovweb/gvm/master/binscripts/gvm-installer)
-          source /home/runner/.gvm/scripts/gvm
-          gvm install ${GO_VERSION} -B
-          gvm use ${GO_VERSION} --default
-          go version
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Run tests
-        shell: bash
-        run: |
-          source /home/runner/.gvm/scripts/gvm
-          gvm use ${GO_VERSION} --default
-          go test ./...
+        run: go test ./...
