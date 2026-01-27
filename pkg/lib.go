@@ -2,10 +2,9 @@ package raria2
 
 import (
 	"bufio"
-	"github.com/PuerkitoBio/goquery"
-	"github.com/sirupsen/logrus"
+	"bytes"
+	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,33 +13,62 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/sirupsen/logrus"
 )
 
 type RAria2 struct {
-	url                       *url.URL
-	ParallelJobs              int
-	ParallelConnectionsPerJob int
-	ConcurrentDownloadsPerJob int
-	OutputPath string
+	url                    *url.URL
+	MaxConnectionPerServer int
+	MaxConcurrentDownload  int
+	OutputPath             string
+	Aria2AfterURLArgs      []string
 
 	urlList    []string
 	httpClient *http.Client
 
+	downloadEntries   []aria2URLEntry
+	downloadEntriesMu sync.Mutex
+
 	// does not perform any resource download
 	dryRun bool
 
-	// Sync functions
-	wg *sync.WaitGroup
-	urlCache map[string]bool
+	urlCache   map[string]struct{}
+	urlCacheMu sync.Mutex
 }
 
 func New(url *url.URL) *RAria2 {
 	return &RAria2{
-		url:                       url,
-		ParallelJobs:              5,
-		ParallelConnectionsPerJob: 5,
-		ConcurrentDownloadsPerJob: 5,
+		url:                    url,
+		MaxConnectionPerServer: 5,
+		MaxConcurrentDownload:  5,
+		urlCache:               make(map[string]struct{}),
 	}
+}
+
+func (r *RAria2) ensureOutputPath() error {
+	if r.OutputPath == "" {
+		if r.url == nil {
+			return fmt.Errorf("unable to derive output path: source URL is nil")
+		}
+		host := r.url.Host
+		path := strings.Trim(r.url.Path, "/")
+		if host == "" {
+			host = "download"
+		}
+		if path == "" {
+			r.OutputPath = host
+		} else {
+			r.OutputPath = filepath.Join(host, filepath.FromSlash(path))
+		}
+	}
+	if _, err := os.Stat(r.OutputPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(r.OutputPath, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *RAria2) client() *http.Client {
@@ -52,7 +80,7 @@ func (r *RAria2) client() *http.Client {
 	return r.httpClient
 }
 
-func (r *RAria2) IsHtmlPage(urlString string) (bool, error){
+func (r *RAria2) IsHtmlPage(urlString string) (bool, error) {
 	req, err := http.NewRequest("HEAD", urlString, nil)
 	if err != nil {
 		return false, err
@@ -93,13 +121,8 @@ func (r *RAria2) getLinksByUrl(urlString string) ([]string, error) {
 }
 
 func (r *RAria2) Run() error {
-
-	// Check that output path exists
-	if _, err := os.Stat(r.OutputPath); os.IsNotExist(err) {
-		err = os.Mkdir(r.OutputPath, 0755)
-		if err != nil {
-			return err
-		}
+	if err := r.ensureOutputPath(); err != nil {
+		return err
 	}
 	dir, _ := os.Getwd()
 	logrus.Infof("pwd: %v", dir)
@@ -110,41 +133,17 @@ func (r *RAria2) Run() error {
 		return err
 	}
 
-	logrus.Infof("got %d URLs: dividing them into %d jobs", len(r.urlList), r.ParallelJobs)
-
-	jobSplit := int(math.Ceil(float64(float32(len(r.urlList)) / float32(r.ParallelJobs))))
-	r.wg = &sync.WaitGroup{}
-
-	for i := 0; i < r.ParallelJobs; i++ {
-		beginIndex := i * jobSplit
-		endIndex := intMin((i+1) * jobSplit, len(r.urlList))
-		if beginIndex > endIndex {
-			break
-		}
-		r.wg.Add(1)
-		go r.downloadUrls(i, r.urlList[beginIndex:endIndex])
+	logrus.Infof("queuing %d URLs for batch download", len(r.urlList))
+	for _, link := range r.urlList {
+		r.subDownloadUrls(0, link)
 	}
 
-	r.wg.Wait()
+	return r.executeBatchDownload()
 
-	return nil
-
-}
-
-func (r *RAria2) downloadUrls(workerId int, urls []string) {
-	// Do some work
-	for _, cUrl := range urls {
-		r.subDownloadUrls(workerId, cUrl)
-	}
-	// End of work
-
-	logrus.Infof("worker %d ended his work (url=%v)", workerId, urls)
-	r.wg.Done()
 }
 
 func (r *RAria2) subDownloadUrls(workerId int, cUrl string) {
-	// Check if cache has already seen this URL
-	if r.urlCache[cUrl] {
+	if !r.markVisited(cUrl) {
 		logrus.Infof("cache hit for %v. won't re-visit", cUrl)
 		return
 	}
@@ -197,65 +196,128 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 	}
 
 	outputDir := filepath.Join(r.OutputPath, filepath.Dir(outputPath))
-	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+	if err := r.ensureOutputDir(workerId, outputDir); err != nil {
+		logrus.Warnf("unable to create %v: %v", outputDir, err)
+		return
+	}
+
+	entry := aria2URLEntry{URL: cUrl, Dir: outputDir}
+	r.enqueueDownloadEntry(entry)
+	logrus.Infof("[W %d]: queued %s for batch download (dir=%s)", workerId, cUrl, outputDir)
+}
+
+func (r *RAria2) markVisited(u string) bool {
+	r.urlCacheMu.Lock()
+	defer r.urlCacheMu.Unlock()
+	if _, exists := r.urlCache[u]; exists {
+		return false
+	}
+	r.urlCache[u] = struct{}{}
+	return true
+}
+
+func (r *RAria2) ensureOutputDir(workerId int, dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if r.dryRun {
-			logrus.Infof("[W %d]: dry run: creating folder %s", workerId, outputDir)
-		} else {
-			err = os.MkdirAll(outputDir, 0744)
-			if err != nil {
-				logrus.Warnf("unable to create %v: %v", outputDir, err)
-				return
+			logrus.Infof("[W %d]: dry run: creating folder %s", workerId, dir)
+			return nil
+		}
+		if err := os.MkdirAll(dir, 0o744); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *RAria2) enqueueDownloadEntry(entry aria2URLEntry) {
+	r.downloadEntriesMu.Lock()
+	defer r.downloadEntriesMu.Unlock()
+	r.downloadEntries = append(r.downloadEntries, entry)
+}
+
+func (r *RAria2) executeBatchDownload() error {
+	r.downloadEntriesMu.Lock()
+	entries := make([]aria2URLEntry, len(r.downloadEntries))
+	copy(entries, r.downloadEntries)
+	r.downloadEntriesMu.Unlock()
+
+	if len(entries) == 0 {
+		logrus.Info("no downloadable resources found")
+		return nil
+	}
+
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	for _, entry := range entries {
+		if _, err := fmt.Fprintln(writer, entry.URL); err != nil {
+			return err
+		}
+		if entry.Dir != "" {
+			if _, err := fmt.Fprintf(writer, "  dir=%s\n", entry.Dir); err != nil {
+				return err
 			}
 		}
 	}
 
-	binFile := "aria2c"
-	args := []string{"-x", strconv.Itoa(r.ParallelConnectionsPerJob), "-d", outputDir}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
 
-	// cmd
+	binFile := "aria2c"
+	args := []string{"-x", strconv.Itoa(r.MaxConnectionPerServer)}
+	if r.MaxConcurrentDownload > 0 {
+		args = append(args, "-j", strconv.Itoa(r.MaxConcurrentDownload))
+	}
+	args = append(args, "--input-file", "-", "--deferred-input=true")
+
 	if r.dryRun {
 		args = append(args, "--dry-run=true")
 	}
 
-	args = append(args, cUrl)
+	if len(r.Aria2AfterURLArgs) > 0 {
+		args = append(args, r.Aria2AfterURLArgs...)
+	}
 
 	if r.dryRun {
-		logrus.Infof("cmd: %s %s", binFile, strings.Join(args, " "))
+		logrus.Infof("aria2 batch cmd: %s %s", binFile, strings.Join(args, " "))
+		return nil
 	}
 
 	cmd := exec.Command(binFile, args...)
+	cmd.Stdin = bytes.NewReader(buf.Bytes())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		logrus.Warnf("unable to get stdout for subcommand: %v", err)
-		return
+		return fmt.Errorf("unable to get stdout for aria2 batch command: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		logrus.Warnf("unable to get stderr for subcommand: %v", err)
-		return
+		return fmt.Errorf("unable to get stderr for aria2 batch command: %w", err)
 	}
 	stdoutScanner := bufio.NewScanner(stdout)
 	stderrScanner := bufio.NewScanner(stderr)
 
-	err = cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("unable to start aria2 batch command: %w", err)
+	}
 
 	for stdoutScanner.Scan() {
-		logrus.Infof("[W %d]: %s reports: %v", workerId, binFile, stdoutScanner.Text())
+		logrus.Infof("aria2c reports: %v", stdoutScanner.Text())
 	}
 
 	for stderrScanner.Scan() {
-		logrus.Warnf("[W %d]: %s reports: %v", workerId, binFile, stderrScanner.Text())
+		logrus.Warnf("aria2c reports: %v", stderrScanner.Text())
 	}
 
-	if err != nil {
-		logrus.Warnf("unable to run %v: %v", binFile, err)
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("aria2 batch command failed: %w", err)
 	}
 
-	err = cmd.Wait()
+	return nil
+}
 
-	if err != nil {
-		logrus.Warnf("unable to wait %v: %v", binFile, err)
-	}
+type aria2URLEntry struct {
+	URL string
+	Dir string
 }
 
 func intMin(a int, b int) int {
