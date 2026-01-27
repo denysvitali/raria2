@@ -50,7 +50,7 @@ jobs:
           if [ "${GOOS}" = "windows" ]; then
             OUTPUT="${OUTPUT}.exe"
           fi
-          go build -trimpath -ldflags "-s -w" -o "${OUTPUT}" ./cmd/raria2.go
+          go build -trimpath -ldflags "-s -w" -o "${OUTPUT}" ./main.go
 
       - name: Package artifact
         id: package
