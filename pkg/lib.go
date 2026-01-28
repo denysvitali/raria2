@@ -285,30 +285,10 @@ func (r *RAria2) executeBatchDownload() error {
 
 	cmd := exec.Command(binFile, args...)
 	cmd.Stdin = bytes.NewReader(buf.Bytes())
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("unable to get stdout for aria2 batch command: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("unable to get stderr for aria2 batch command: %w", err)
-	}
-	stdoutScanner := bufio.NewScanner(stdout)
-	stderrScanner := bufio.NewScanner(stderr)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("unable to start aria2 batch command: %w", err)
-	}
-
-	for stdoutScanner.Scan() {
-		logrus.Infof("aria2c reports: %v", stdoutScanner.Text())
-	}
-
-	for stderrScanner.Scan() {
-		logrus.Warnf("aria2c reports: %v", stderrScanner.Text())
-	}
-
-	if err := cmd.Wait(); err != nil {
+	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("aria2 batch command failed: %w", err)
 	}
 
