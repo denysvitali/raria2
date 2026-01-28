@@ -1,13 +1,16 @@
 package raria2
 
 import (
+	"bufio"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -25,8 +28,238 @@ func TestSameUrl(t *testing.T) {
 	assert.False(t, SameUrl(firstUrl, fourthUrl))
 }
 
+func TestPathAllowedAcceptAndReject(t *testing.T) {
+	base := mustParseURL(t, "https://example.com/root/")
+	r := &RAria2{
+		url: base,
+		AcceptPathRegex: []*regexp.Regexp{
+			regexp.MustCompile(`^/root/files/`),
+		},
+	}
+
+	assert.True(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/")))
+	assert.True(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/files/doc.bin")))
+	assert.False(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/misc")))
+
+	r.RejectPathRegex = []*regexp.Regexp{regexp.MustCompile(`\.tmp$`)}
+	assert.False(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/files/data.tmp")))
+}
+
+func TestFilenameAllowedAcceptAndReject(t *testing.T) {
+	base := mustParseURL(t, "https://example.com/root/")
+	r := &RAria2{url: base}
+
+	// Test accept filename glob
+	pattern := regexp.MustCompile(`^file.*\.bin$`)
+	r.AcceptFilenames = map[string]*regexp.Regexp{
+		"file*.bin": pattern,
+	}
+	assert.True(t, r.filenameAllowed(mustParseURL(t, "https://example.com/root/file1.bin")))
+	assert.True(t, r.filenameAllowed(mustParseURL(t, "https://example.com/root/file123.bin")))
+	assert.False(t, r.filenameAllowed(mustParseURL(t, "https://example.com/root/other.bin")))
+
+	// Test reject filename glob
+	r.AcceptFilenames = nil
+	pattern = regexp.MustCompile(`^.*\.tmp$`)
+	r.RejectFilenames = map[string]*regexp.Regexp{
+		"*.tmp": pattern,
+	}
+	assert.False(t, r.filenameAllowed(mustParseURL(t, "https://example.com/root/data.tmp")))
+	assert.True(t, r.filenameAllowed(mustParseURL(t, "https://example.com/root/data.bin")))
+}
+
+func TestCaseInsensitivePaths(t *testing.T) {
+	base := mustParseURL(t, "https://example.com/root/")
+	r := &RAria2{url: base, CaseInsensitivePaths: true}
+
+	// Test case-insensitive path matching
+	pattern := regexp.MustCompile(`^/root/files/.*`)
+	r.AcceptPathRegex = []*regexp.Regexp{pattern}
+	assert.True(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/FILES/data.bin")))
+	assert.True(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/files/data.bin")))
+
+	// Test case-insensitive reject
+	r.AcceptPathRegex = nil
+	pattern = regexp.MustCompile(`^/root/temp/.*`)
+	r.RejectPathRegex = []*regexp.Regexp{pattern}
+	assert.False(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/TEMP/data.bin")))
+	assert.True(t, r.pathAllowed(mustParseURL(t, "https://example.com/root/other/data.bin")))
+}
+
+func TestExtensionAllowedAcceptAndReject(t *testing.T) {
+	base := mustParseURL(t, "https://example.com/root/")
+	r := &RAria2{url: base, AcceptExtensions: map[string]struct{}{"bin": {}, "iso": {}}}
+	assert.True(t, r.extensionAllowed(mustParseURL(t, "https://example.com/root/image.iso")))
+	assert.False(t, r.extensionAllowed(mustParseURL(t, "https://example.com/root/image.txt")))
+
+	r.AcceptExtensions = nil
+	r.RejectExtensions = map[string]struct{}{"zip": {}}
+	assert.False(t, r.extensionAllowed(mustParseURL(t, "https://example.com/root/archive.zip")))
+	assert.True(t, r.extensionAllowed(mustParseURL(t, "https://example.com/root/archive.bin")))
+}
+
+func TestMatchAnyRegexHelper(t *testing.T) {
+	patterns := []*regexp.Regexp{regexp.MustCompile(`foo`), regexp.MustCompile(`bar`)}
+	assert.True(t, matchAnyRegex(patterns, "xxbarxx"))
+	assert.False(t, matchAnyRegex(patterns, "baz"))
+}
+
+func TestEnsureOutputDirExisting(t *testing.T) {
+	tmp := tempDir(t)
+	target := filepath.Join(tmp, "existing")
+	assert.NoError(t, os.MkdirAll(target, 0o755))
+	r := &RAria2{}
+	assert.NoError(t, r.ensureOutputDir(0, target))
+}
+
+func TestEnqueueDownloadEntry(t *testing.T) {
+	r := &RAria2{}
+	r.enqueueDownloadEntry(aria2URLEntry{URL: "https://example.com/a", Dir: "out"})
+	assert.Len(t, r.downloadEntries, 1)
+	assert.Equal(t, "https://example.com/a", r.downloadEntries[0].URL)
+}
+
+func TestIsHTMLContent(t *testing.T) {
+	assert.True(t, isHTMLContent("text/html; charset=utf-8"))
+	assert.True(t, isHTMLContent("text/html"))
+	assert.False(t, isHTMLContent("application/octet-stream"))
+}
+
+func TestRun_FailsWhenAria2Missing(t *testing.T) {
+	oldLookPath := lookPath
+	defer func() { lookPath = oldLookPath }()
+	lookPath = func(string) (string, error) {
+		return "", fmt.Errorf("not found")
+	}
+
+	client := &RAria2{}
+	err := client.Run()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "aria2c is required")
+}
+
+func TestDownloadResource_ExtensionFilters(t *testing.T) {
+	baseURL, _ := url.Parse("https://example.com/root/")
+	outputDir := tempDir(t)
+	r := &RAria2{
+		url:              baseURL,
+		OutputPath:       outputDir,
+		DryRun:           true,
+		AcceptExtensions: map[string]struct{}{"bin": {}},
+	}
+
+	r.downloadResource(1, "https://example.com/root/file.bin")
+	assert.Len(t, r.downloadEntries, 1)
+
+	r.downloadEntries = nil
+	r.AcceptExtensions = map[string]struct{}{"txt": {}}
+	r.downloadResource(1, "https://example.com/root/file.bin")
+	assert.Len(t, r.downloadEntries, 0)
+
+	r.AcceptExtensions = nil
+	r.RejectExtensions = map[string]struct{}{"bin": {}}
+	r.downloadResource(1, "https://example.com/root/file.bin")
+	assert.Len(t, r.downloadEntries, 0)
+}
+
+func TestRun_PathFilters(t *testing.T) {
+	ts := newFixtureServer()
+	t.Cleanup(ts.Close)
+
+	baseURL, err := url.Parse(ts.URL + "/")
+	assert.Nil(t, err)
+	client := newTestClient(baseURL)
+	client.OutputPath = tempDir(t)
+	client.AcceptPathRegex = []*regexp.Regexp{regexp.MustCompile(`^/files/`)}
+
+	err = client.Run()
+	assert.Nil(t, err)
+	if assert.Len(t, client.downloadEntries, 2) {
+		for _, entry := range client.downloadEntries {
+			assert.Contains(t, entry.URL, "/files/")
+		}
+	}
+}
+
+func TestRun_RespectsMaxDepth(t *testing.T) {
+	ts := newFixtureServer()
+	t.Cleanup(ts.Close)
+
+	baseURL, err := url.Parse(ts.URL + "/")
+	assert.Nil(t, err)
+	client := New(baseURL)
+	client.OutputPath = tempDir(t)
+	client.DryRun = true
+	client.MaxDepth = 0
+
+	err = client.Run()
+	assert.Nil(t, err)
+	assert.Len(t, client.downloadEntries, 0)
+}
+
+var lastExecArgs []string
+
+func fakeExecCommand(command string, args ...string) *exec.Cmd {
+	lastExecArgs = append([]string{command}, args...)
+	cs := []string{"-test.run=TestHelperProcess", "--", command}
+	cs = append(cs, args...)
+	cmd := exec.Command(os.Args[0], cs...)
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	return cmd
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	os.Exit(0)
+}
+
+func TestExecuteBatchDownloadInvokesCommand(t *testing.T) {
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+	lastExecArgs = nil
+	execCommand = fakeExecCommand
+
+	r := &RAria2{
+		MaxConnectionPerServer: 2,
+		MaxConcurrentDownload:  1,
+		urlCache:               make(map[string]struct{}),
+	}
+	r.enqueueDownloadEntry(aria2URLEntry{URL: "https://example.com/file1.bin", Dir: "out"})
+
+	assert.NoError(t, r.executeBatchDownload())
+	if assert.NotEmpty(t, lastExecArgs) {
+		assert.Equal(t, "aria2c", lastExecArgs[0])
+		assert.Contains(t, lastExecArgs, "--input-file")
+	}
+}
+
+func TestExecuteBatchDownloadNoEntries(t *testing.T) {
+	r := &RAria2{}
+	assert.NoError(t, r.executeBatchDownload())
+}
+
+func TestGetLinksByUrlFetchesRemoteLinks(t *testing.T) {
+	ts := newFixtureServer()
+	t.Cleanup(ts.Close)
+	base, _ := url.Parse(ts.URL + "/")
+	r := newTestClient(base)
+
+	links, err := r.getLinksByUrl(ts.URL + "/")
+	assert.NoError(t, err)
+	assert.Contains(t, links, ts.URL+"/files/file1.bin")
+	assert.Contains(t, links, ts.URL+"/more/")
+}
+
+func TestGetLinksByUrlRejectsInvalidURL(t *testing.T) {
+	r := &RAria2{}
+	_, err := r.getLinksByUrl(":/broken")
+	assert.Error(t, err)
+}
+
 func tempDir(t *testing.T) string {
-	dir, err := ioutil.TempDir("", "raria2-test-")
+	dir, err := os.MkdirTemp("", "raria2-test-")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
@@ -42,7 +275,7 @@ func TestRun_WithRootFixture(t *testing.T) {
 	assert.Nil(t, err)
 	client := New(webUrl)
 	client.OutputPath = tempDir(t)
-	client.dryRun = true
+	client.DryRun = true
 
 	err = client.Run()
 	assert.Nil(t, err)
@@ -56,7 +289,7 @@ func TestRun_FromNestedPath(t *testing.T) {
 	assert.Nil(t, err)
 	client := New(webUrl)
 	client.OutputPath = tempDir(t)
-	client.dryRun = true
+	client.DryRun = true
 	client.MaxConcurrentDownload = 2
 	client.MaxConnectionPerServer = 2
 
@@ -67,11 +300,8 @@ func TestRun_FromNestedPath(t *testing.T) {
 func TestIsHtmlPage_DistinguishesHtml(t *testing.T) {
 	ts := newFixtureServer()
 	t.Cleanup(ts.Close)
-
-	baseUrl, err := url.Parse(ts.URL + "/")
-	assert.Nil(t, err)
-	client := New(baseUrl)
-	client.dryRun = true
+	base, _ := url.Parse(ts.URL + "/")
+	client := newTestClient(base)
 
 	isHtmlPage, err := client.IsHtmlPage(ts.URL + "/")
 	assert.Nil(t, err)
@@ -91,7 +321,9 @@ func newFixtureServer() *httptest.Server {
 			if r.Method == http.MethodHead {
 				return
 			}
-			io.WriteString(w, body)
+			if _, err := io.WriteString(w, body); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 		}
 	}
 
@@ -101,7 +333,9 @@ func newFixtureServer() *httptest.Server {
 			if r.Method == http.MethodHead {
 				return
 			}
-			io.WriteString(w, content)
+			if _, err := io.WriteString(w, content); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 		}
 	}
 
@@ -130,7 +364,7 @@ func TestDownloadResource_ComputesRelativeOutputDir(t *testing.T) {
 	r := &RAria2{
 		url:        baseURL,
 		OutputPath: outputDir,
-		dryRun:     true,
+		DryRun:     true,
 	}
 
 	r.downloadResource(1, "https://example.com/root/assets/img/file.png")
@@ -146,23 +380,39 @@ func TestDownloadResource_ExternalHostFallsBackToHostDir(t *testing.T) {
 	baseURL, _ := url.Parse("https://example.com/root/")
 	outputDir := tempDir(t)
 	r := &RAria2{
-		url:        baseURL,
-		OutputPath: outputDir,
-		dryRun:     true,
+		url:            baseURL,
+		OutputPath:     outputDir,
+		DryRun:         true,
+		DisableRetries: true, // Disable retries to avoid network timeout
 	}
 
-	r.downloadResource(1, "https://cdn.example.net/files/asset.bin")
+	// Mock the HTTP request to avoid network dependency
+	originalExecCommand := execCommand
+	defer func() { execCommand = originalExecCommand }()
+
+	// Create a mock server that returns a simple response
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Use the test server URL directly (it's HTTP, not HTTPS)
+	testURL := server.URL + "/files/asset.bin"
+	r.downloadResource(1, testURL)
 
 	if assert.Len(t, r.downloadEntries, 1) {
 		entry := r.downloadEntries[0]
-		expectedDir := filepath.Join(outputDir, "cdn.example.net/files")
+		// Extract hostname from the test URL
+		parsedURL, _ := url.Parse(testURL)
+		expectedDir := filepath.Join(outputDir, parsedURL.Host+"/files")
 		assert.Equal(t, expectedDir, entry.Dir)
 	}
 }
 
 func TestGetLinks_FiltersNonSubPaths(t *testing.T) {
 	original, _ := url.Parse("https://example.com/root/")
-	body := ioutil.NopCloser(strings.NewReader(`
+	body := io.NopCloser(strings.NewReader(`
 <html><body>
   <a href="https://example.com/root/file1.bin">file1</a>
   <a href="/root/file2.bin">file2</a>
@@ -180,7 +430,7 @@ func TestGetLinks_FiltersNonSubPaths(t *testing.T) {
 
 func TestGetLinks_MirrorNforceFormat(t *testing.T) {
 	base, _ := url.Parse("https://mirror.nforce.com/pub/speedtests/")
-	body := ioutil.NopCloser(strings.NewReader(`
+	body := io.NopCloser(strings.NewReader(`
 <html><body>
   <table>
     <tr><td><a href="10mb.bin">&lt;10mb.bin&gt;</a></td></tr>
@@ -200,7 +450,7 @@ func TestGetLinks_MirrorNforceFormat(t *testing.T) {
 
 func TestGetLinks_CopypartyFormat(t *testing.T) {
 	base, _ := url.Parse("https://a.ocv.me/pub/demo/")
-	body := ioutil.NopCloser(strings.NewReader(`
+	body := io.NopCloser(strings.NewReader(`
 <html><body>
   <table>
     <tr><td>DIR</td><td><a href="docs/">&lt;docs/&gt;</a></td></tr>
@@ -216,4 +466,182 @@ func TestGetLinks_CopypartyFormat(t *testing.T) {
 		"https://a.ocv.me/pub/demo/pics-vids/",
 		"https://a.ocv.me/pub/demo/showcase-hq.webm",
 	}, links)
+}
+
+func TestEnsureOutputPathDerivesFromURL(t *testing.T) {
+	origDir, err := os.Getwd()
+	assert.NoError(t, err)
+	tmp := tempDir(t)
+	assert.NoError(t, os.Chdir(tmp))
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	base := mustParseURL(t, "https://example.com/root/path/")
+	r := &RAria2{url: base, urlCache: make(map[string]struct{})}
+
+	err = r.ensureOutputPath()
+	assert.NoError(t, err)
+	expected := filepath.Join("example.com", filepath.FromSlash("root/path"))
+	assert.Equal(t, expected, r.OutputPath)
+	_, statErr := os.Stat(expected)
+	assert.NoError(t, statErr)
+}
+
+func TestEnsureOutputPathHonorsCustomDir(t *testing.T) {
+	tmp := tempDir(t)
+	custom := filepath.Join(tmp, "custom-out")
+	base := mustParseURL(t, "https://example.com/root/")
+	r := &RAria2{url: base, OutputPath: custom, urlCache: make(map[string]struct{})}
+	assert.NoError(t, os.MkdirAll(custom, 0o755))
+
+	assert.NoError(t, r.ensureOutputPath())
+	assert.Equal(t, custom, r.OutputPath)
+}
+
+func TestEnsureOutputPathFailWithoutURL(t *testing.T) {
+	r := &RAria2{urlCache: make(map[string]struct{})}
+	err := r.ensureOutputPath()
+	assert.Error(t, err)
+}
+
+func TestEnsureOutputDirCreatesDirectories(t *testing.T) {
+	tmp := tempDir(t)
+	target := filepath.Join(tmp, "nested", "dir")
+	r := &RAria2{}
+
+	assert.NoError(t, r.ensureOutputDir(0, target))
+	info, err := os.Stat(target)
+	assert.NoError(t, err)
+	assert.True(t, info.IsDir())
+}
+
+func TestEnsureOutputDirDryRunSkipsCreation(t *testing.T) {
+	tmp := tempDir(t)
+	target := filepath.Join(tmp, "dry", "dir")
+	r := &RAria2{DryRun: true}
+
+	assert.NoError(t, r.ensureOutputDir(1, target))
+	_, err := os.Stat(target)
+	assert.Error(t, err)
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestMarkVisitedCachesURLs(t *testing.T) {
+	r := &RAria2{urlCache: make(map[string]struct{})}
+	assert.True(t, r.markVisited("https://example.com"))
+	assert.False(t, r.markVisited("https://example.com"))
+}
+
+func TestVisitedCachePersistence(t *testing.T) {
+	tmp := tempDir(t)
+	cacheFile := filepath.Join(tmp, "visited.txt")
+	initial := []string{
+		"https://example.com/root/",
+		"https://example.com/root/file.bin",
+	}
+	writeVisitedCache(t, cacheFile, initial)
+
+	r := &RAria2{urlCache: make(map[string]struct{}), VisitedCachePath: cacheFile}
+	assert.NoError(t, r.loadVisitedCache())
+
+	assert.False(t, r.markVisited(initial[0]))
+	assert.False(t, r.markVisited(initial[1]))
+	assert.True(t, r.markVisited("https://example.com/root/new.bin"))
+
+	assert.NoError(t, r.saveVisitedCache())
+	fileEntries := readVisitedCache(t, cacheFile)
+	assert.Contains(t, fileEntries, canonicalCacheKey("https://example.com/root/new.bin"))
+}
+
+func writeVisitedCache(t *testing.T, path string, entries []string) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("failed to create cache file: %v", err)
+	}
+	defer file.Close()
+	writer := bufio.NewWriter(file)
+	for _, entry := range entries {
+		if _, err := writer.WriteString(entry + "\n"); err != nil {
+			t.Fatalf("failed writing cache entry: %v", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+}
+
+func readVisitedCache(t *testing.T, path string) []string {
+	t.Helper()
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read cache file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(bytes)), "\n")
+	return lines
+}
+
+func TestWriteBatch(t *testing.T) {
+	tmp := tempDir(t)
+	r := &RAria2{
+		downloadEntries: []aria2URLEntry{
+			{URL: "https://example.com/file1.bin", Dir: "downloads"},
+			{URL: "https://example.com/file2.bin", Dir: ""},
+		},
+		WriteBatch: filepath.Join(tmp, "batch.txt"),
+	}
+
+	err := r.executeBatchDownload()
+	assert.NoError(t, err)
+
+	// Check that the file was created and contains the expected content
+	content, err := os.ReadFile(r.WriteBatch)
+	assert.NoError(t, err)
+
+	expected := "https://example.com/file1.bin\n  dir=downloads\nhttps://example.com/file2.bin\n"
+	assert.Equal(t, expected, string(content))
+}
+
+func TestExecuteBatchDownloadDryRun(t *testing.T) {
+	r := &RAria2{
+		DryRun:                 true,
+		MaxConnectionPerServer: 2,
+		MaxConcurrentDownload:  3,
+		urlCache:               make(map[string]struct{}),
+	}
+	r.enqueueDownloadEntry(aria2URLEntry{URL: "https://example.com/file.bin", Dir: "out"})
+
+	assert.NoError(t, r.executeBatchDownload())
+	assert.Len(t, r.downloadEntries, 1)
+}
+
+func TestIsSubPath(t *testing.T) {
+	subject := mustParseURL(t, "https://example.com/root/path")
+	of := mustParseURL(t, "https://example.com/root/")
+	assert.True(t, IsSubPath(subject, of))
+
+	differentHost := mustParseURL(t, "https://cdn.example.com/root/path")
+	assert.False(t, IsSubPath(differentHost, of))
+
+	differentScheme := mustParseURL(t, "http://example.com/root/path")
+	assert.False(t, IsSubPath(differentScheme, of))
+
+	outside := mustParseURL(t, "https://example.com/other")
+	assert.False(t, IsSubPath(outside, of))
+}
+
+func newTestClient(baseURL *url.URL) *RAria2 {
+	r := New(baseURL)
+	r.DryRun = true
+	r.DisableRetries = true
+	r.RateLimit = 0 // Disable rate limiting for tests
+	return r
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("failed to parse URL %q: %v", raw, err)
+	}
+	return parsed
 }

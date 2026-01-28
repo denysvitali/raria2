@@ -22,8 +22,12 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+          - goos: linux
+            goarch: arm64
           - goos: darwin
             goarch: amd64
+          - goos: darwin
+            goarch: arm64
           - goos: windows
             goarch: amd64
     env:
@@ -53,15 +57,52 @@ jobs:
           if [ "${GOOS}" = "windows" ]; then
             OUTPUT="${OUTPUT}.exe"
           fi
-          go build -trimpath -ldflags "-s -w" -o "${OUTPUT}" ./main.go
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "${OUTPUT}" ./main.go
           echo "binary_name=${BINARY}" >> "$GITHUB_OUTPUT"
           echo "binary_path=${OUTPUT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          cd dist
+          BINARY_NAME="${{ steps.compile.outputs.binary_name }}"
+          if [ "${GOOS}" = "windows" ]; then
+            zip "${BINARY_NAME}.zip" "${BINARY_NAME}.exe"
+            echo "archive_path=dist/${BINARY_NAME}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "${BINARY_NAME}.tar.gz" "${BINARY_NAME}"
+            echo "archive_path=dist/${BINARY_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate checksum
+        run: |
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            sha256sum "${{ steps.compile.outputs.binary_name }}.zip" >> SHA256SUMS
+          else
+            sha256sum "${{ steps.compile.outputs.binary_name }}.tar.gz" >> SHA256SUMS
+          fi
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.compile.outputs.binary_name }}-checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.compile.outputs.binary_name }}
           path: ${{ steps.compile.outputs.binary_path }}
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.compile.outputs.binary_name }}-archive
+          path: dist/${{ steps.compile.outputs.binary_name }}.*
 
   release:
     name: Publish release
@@ -82,4 +123,6 @@ jobs:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            release/**/*
+            release/**/*.tar.gz
+            release/**/*.zip
+            release/**/SHA256SUMS
