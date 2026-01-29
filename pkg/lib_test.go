@@ -2,6 +2,7 @@ package raria2
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -215,6 +216,25 @@ func TestHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
+func TestHelperProcessCaptureInput(t *testing.T) {
+	if os.Getenv("GO_WANT_CAPTURE_INPUT") != "1" {
+		return
+	}
+	capturePath := os.Getenv("CAPTURE_INPUT_PATH")
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read stdin: %v", err)
+		os.Exit(2)
+	}
+	if capturePath != "" {
+		if err := os.WriteFile(capturePath, data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write capture file: %v", err)
+			os.Exit(3)
+		}
+	}
+	os.Exit(0)
+}
+
 func TestExecuteBatchDownloadInvokesCommand(t *testing.T) {
 	oldExec := execCommand
 	defer func() { execCommand = oldExec }()
@@ -226,9 +246,15 @@ func TestExecuteBatchDownloadInvokesCommand(t *testing.T) {
 		MaxConcurrentDownload:  1,
 		urlCache:               make(map[string]struct{}),
 	}
-	r.enqueueDownloadEntry(aria2URLEntry{URL: "https://example.com/file1.bin", Dir: "out"})
 
-	assert.NoError(t, r.executeBatchDownload())
+	entry := aria2URLEntry{URL: "https://example.com/file1.bin", Dir: "out"}
+	r.downloadEntries = append(r.downloadEntries, entry)
+
+	entries := make(chan aria2URLEntry, 1)
+	entries <- entry
+	close(entries)
+
+	assert.NoError(t, r.executeBatchDownload(context.Background(), entries))
 	if assert.NotEmpty(t, lastExecArgs) {
 		assert.Equal(t, "aria2c", lastExecArgs[0])
 		assert.Contains(t, lastExecArgs, "--input-file")
@@ -237,7 +263,9 @@ func TestExecuteBatchDownloadInvokesCommand(t *testing.T) {
 
 func TestExecuteBatchDownloadNoEntries(t *testing.T) {
 	r := &RAria2{}
-	assert.NoError(t, r.executeBatchDownload())
+	entries := make(chan aria2URLEntry)
+	close(entries)
+	assert.NoError(t, r.executeBatchDownload(context.Background(), entries))
 }
 
 func TestGetLinksByUrlFetchesRemoteLinks(t *testing.T) {
@@ -583,14 +611,20 @@ func readVisitedCache(t *testing.T, path string) []string {
 func TestWriteBatch(t *testing.T) {
 	tmp := tempDir(t)
 	r := &RAria2{
-		downloadEntries: []aria2URLEntry{
-			{URL: "https://example.com/file1.bin", Dir: "downloads"},
-			{URL: "https://example.com/file2.bin", Dir: ""},
-		},
 		WriteBatch: filepath.Join(tmp, "batch.txt"),
 	}
 
-	err := r.executeBatchDownload()
+	entries := make(chan aria2URLEntry)
+	go func() {
+		entry1 := aria2URLEntry{URL: "https://example.com/file1.bin", Dir: "downloads"}
+		entry2 := aria2URLEntry{URL: "https://example.com/file2.bin", Dir: ""}
+		r.downloadEntries = append(r.downloadEntries, entry1, entry2)
+		entries <- entry1
+		entries <- entry2
+		close(entries)
+	}()
+
+	err := r.executeBatchDownload(context.Background(), entries)
 	assert.NoError(t, err)
 
 	// Check that the file was created and contains the expected content
@@ -602,16 +636,86 @@ func TestWriteBatch(t *testing.T) {
 }
 
 func TestExecuteBatchDownloadDryRun(t *testing.T) {
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+	lastExecArgs = nil
+	execCommand = fakeExecCommand
+
 	r := &RAria2{
 		DryRun:                 true,
 		MaxConnectionPerServer: 2,
 		MaxConcurrentDownload:  3,
 		urlCache:               make(map[string]struct{}),
 	}
-	r.enqueueDownloadEntry(aria2URLEntry{URL: "https://example.com/file.bin", Dir: "out"})
 
-	assert.NoError(t, r.executeBatchDownload())
+	entry := aria2URLEntry{URL: "https://example.com/file.bin", Dir: "out"}
+	r.downloadEntries = append(r.downloadEntries, entry)
+	entries := make(chan aria2URLEntry, 1)
+	entries <- entry
+	close(entries)
+
+	assert.NoError(t, r.executeBatchDownload(context.Background(), entries))
 	assert.Len(t, r.downloadEntries, 1)
+}
+
+func TestWriteBatchEntryFormatsDir(t *testing.T) {
+	var buf strings.Builder
+	writer := bufio.NewWriter(&buf)
+	entry := aria2URLEntry{URL: "https://example.com/file.bin", Dir: "out"}
+	assert.NoError(t, writeBatchEntry(writer, entry))
+	assert.NoError(t, writer.Flush())
+	assert.Equal(t, "https://example.com/file.bin\n  dir=out\n", buf.String())
+
+	buf.Reset()
+	writer.Reset(&buf)
+	entry.Dir = ""
+	assert.NoError(t, writeBatchEntry(writer, entry))
+	assert.NoError(t, writer.Flush())
+	assert.Equal(t, "https://example.com/file.bin\n", buf.String())
+}
+
+func TestBatchFileSinkWritesEntries(t *testing.T) {
+	tmp := tempDir(t)
+	path := filepath.Join(tmp, "batch.txt")
+	sink, err := newBatchFileSink(path)
+	assert.NoError(t, err)
+
+	entry := aria2URLEntry{URL: "https://example.com/file.bin", Dir: "downloads"}
+	assert.NoError(t, sink.Write(entry))
+	assert.NoError(t, sink.Close())
+
+	content, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "https://example.com/file.bin\n  dir=downloads\n", string(content))
+}
+
+func TestAria2SinkStreamsEntries(t *testing.T) {
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+	tmp := tempDir(t)
+	capture := filepath.Join(tmp, "aria2-input.txt")
+	execCommand = func(command string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestHelperProcessCaptureInput", "--", command}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_CAPTURE_INPUT=1",
+			"CAPTURE_INPUT_PATH="+capture,
+		)
+		return cmd
+	}
+
+	r := &RAria2{MaxConnectionPerServer: 1, MaxConcurrentDownload: 1}
+	sink, err := newAria2Sink(context.Background(), r)
+	assert.NoError(t, err)
+
+	entry := aria2URLEntry{URL: "https://example.com/file.bin", Dir: "out"}
+	assert.NoError(t, sink.Write(entry))
+	assert.NoError(t, sink.Close())
+
+	content, err := os.ReadFile(capture)
+	assert.NoError(t, err)
+	assert.Equal(t, "https://example.com/file.bin\n  dir=out\n", string(content))
 }
 
 func TestIsSubPath(t *testing.T) {

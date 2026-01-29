@@ -76,22 +76,6 @@ jobs:
             echo "archive_path=dist/${BINARY_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Generate checksum
-        run: |
-          cd dist
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            sha256sum "${{ steps.compile.outputs.binary_name }}.zip" >> SHA256SUMS
-          else
-            sha256sum "${{ steps.compile.outputs.binary_name }}.tar.gz" >> SHA256SUMS
-          fi
-
-      - name: Upload checksums
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.compile.outputs.binary_name }}-checksums
-          path: dist/SHA256SUMS
-          if-no-files-found: error
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -125,4 +109,3 @@ jobs:
           files: |
             release/**/*.tar.gz
             release/**/*.zip
-            release/**/SHA256SUMS

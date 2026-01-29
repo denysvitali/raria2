@@ -2,7 +2,6 @@ package raria2
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -75,6 +74,9 @@ type RAria2 struct {
 	// robots.txt cache per host
 	robotsCache   map[string]*robotstxt.RobotsData
 	robotsCacheMu sync.RWMutex
+
+	// channel used to stream download entries to aria2c/batch writer
+	downloadEntriesCh chan aria2URLEntry
 }
 
 func New(url *url.URL) *RAria2 {
@@ -351,13 +353,25 @@ func (r *RAria2) RunWithContext(ctx context.Context) error {
 	dir, _ := os.Getwd()
 	logrus.Infof("pwd: %v", dir)
 
+	entriesCh := make(chan aria2URLEntry)
+	downloadErrCh := make(chan error, 1)
+	r.downloadEntriesCh = entriesCh
+
+	go func() {
+		downloadErrCh <- r.executeBatchDownload(ctx, entriesCh)
+	}()
+
 	r.subDownloadUrls(ctx, 0, r.url.String())
+
+	close(entriesCh)
+	r.downloadEntriesCh = nil
+	downloadErr := <-downloadErrCh
 
 	if err := r.saveVisitedCache(); err != nil {
 		return fmt.Errorf("failed saving visited cache: %w", err)
 	}
 
-	return r.executeBatchDownload()
+	return downloadErr
 }
 
 func (r *RAria2) subDownloadUrls(ctx context.Context, workerId int, startURL string) {
@@ -936,41 +950,76 @@ func (r *RAria2) enqueueDownloadEntry(entry aria2URLEntry) {
 	r.downloadEntriesMu.Lock()
 	defer r.downloadEntriesMu.Unlock()
 	r.downloadEntries = append(r.downloadEntries, entry)
+	if ch := r.downloadEntriesCh; ch != nil {
+		ch <- entry
+	}
 }
 
-func (r *RAria2) executeBatchDownload() error {
-	r.downloadEntriesMu.Lock()
-	entries := make([]aria2URLEntry, len(r.downloadEntries))
-	copy(entries, r.downloadEntries)
-	r.downloadEntriesMu.Unlock()
+func (r *RAria2) executeBatchDownload(ctx context.Context, entries <-chan aria2URLEntry) error {
+	var (
+		sink       downloadSink
+		sinkErr    error
+		entryCount int
+	)
 
-	if len(entries) == 0 {
+	for entry := range entries {
+		if sink == nil {
+			sink, sinkErr = r.newDownloadSink(ctx)
+			if sinkErr != nil {
+				return sinkErr
+			}
+		}
+		entryCount++
+		if err := sink.Write(entry); err != nil {
+			if sink != nil {
+				_ = sink.Close()
+			}
+			return err
+		}
+	}
+
+	if sink == nil {
 		logrus.Info("no downloadable resources found")
 		return nil
 	}
 
-	var buf bytes.Buffer
-	writer := bufio.NewWriter(&buf)
-	for _, entry := range entries {
-		if _, err := fmt.Fprintln(writer, entry.URL); err != nil {
-			return err
-		}
-		if entry.Dir != "" {
-			if _, err := fmt.Fprintf(writer, "  dir=%s\n", entry.Dir); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := writer.Flush(); err != nil {
+	if err := sink.Close(); err != nil {
 		return err
 	}
 
-	// If WriteBatch is set, write to file instead of executing aria2c
 	if r.WriteBatch != "" {
-		return r.writeBatchFile(buf.Bytes())
+		logrus.Infof("wrote aria2 batch file with %d download entries to %s", entryCount, r.WriteBatch)
 	}
 
+	return nil
+}
+
+type aria2URLEntry struct {
+	URL string
+	Dir string
+}
+
+type downloadSink interface {
+	Write(entry aria2URLEntry) error
+	Close() error
+}
+
+func (r *RAria2) newDownloadSink(ctx context.Context) (downloadSink, error) {
+	if r.WriteBatch != "" {
+		return newBatchFileSink(r.WriteBatch)
+	}
+	return newAria2Sink(ctx, r)
+}
+
+type aria2Sink struct {
+	writer    *bufio.Writer
+	pipe      *io.PipeWriter
+	waitCh    chan error
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newAria2Sink(ctx context.Context, r *RAria2) (downloadSink, error) {
 	binFile := "aria2c"
 	args := []string{"-x", strconv.Itoa(r.MaxConnectionPerServer)}
 	if r.MaxConcurrentDownload > 0 {
@@ -988,30 +1037,111 @@ func (r *RAria2) executeBatchDownload() error {
 
 	if r.DryRun {
 		logrus.Infof("aria2 batch cmd: %s %s", binFile, strings.Join(args, " "))
-		return nil
 	}
 
+	reader, writer := io.Pipe()
 	cmd := execCommand(binFile, args...)
-	cmd.Stdin = bytes.NewReader(buf.Bytes())
+	cmd.Stdin = reader
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("aria2 batch command failed: %w", err)
+	if err := cmd.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return nil, fmt.Errorf("failed to start aria2c: %w", err)
 	}
 
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			_ = cmd.Process.Kill()
+		}()
+	}
+
+	return &aria2Sink{
+		writer: bufio.NewWriter(writer),
+		pipe:   writer,
+		waitCh: waitCh,
+	}, nil
+}
+
+func (s *aria2Sink) Write(entry aria2URLEntry) error {
+	return writeBatchEntry(s.writer, entry)
+}
+
+func (s *aria2Sink) Close() error {
+	s.closeOnce.Do(func() {
+		if err := s.writer.Flush(); err != nil {
+			s.closeErr = err
+			return
+		}
+		if err := s.pipe.Close(); err != nil && s.closeErr == nil {
+			s.closeErr = err
+			return
+		}
+		if waitErr := <-s.waitCh; waitErr != nil && s.closeErr == nil {
+			s.closeErr = fmt.Errorf("aria2 batch command failed: %w", waitErr)
+		}
+	})
+	return s.closeErr
+}
+
+type batchFileSink struct {
+	writer    *bufio.Writer
+	file      *os.File
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newBatchFileSink(path string) (downloadSink, error) {
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create batch file %s: %w", path, err)
+	}
+	return &batchFileSink{writer: bufio.NewWriter(file), file: file}, nil
+}
+
+func (s *batchFileSink) Write(entry aria2URLEntry) error {
+	return writeBatchEntry(s.writer, entry)
+}
+
+func (s *batchFileSink) Close() error {
+	s.closeOnce.Do(func() {
+		if err := s.writer.Flush(); err != nil {
+			s.closeErr = err
+			return
+		}
+		if err := s.file.Close(); err != nil {
+			s.closeErr = err
+		}
+	})
+	return s.closeErr
+}
+
+func writeBatchEntry(writer *bufio.Writer, entry aria2URLEntry) error {
+	if _, err := fmt.Fprintln(writer, entry.URL); err != nil {
+		return err
+	}
+	if entry.Dir != "" {
+		if _, err := fmt.Fprintf(writer, "  dir=%s\n", entry.Dir); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (r *RAria2) writeBatchFile(content []byte) error {
-	// Create the file
 	file, err := os.Create(r.WriteBatch)
 	if err != nil {
 		return fmt.Errorf("failed to create batch file %s: %w", r.WriteBatch, err)
 	}
 	defer file.Close()
 
-	// Write the content
 	if _, err := file.Write(content); err != nil {
 		return fmt.Errorf("failed to write batch file %s: %w", r.WriteBatch, err)
 	}
@@ -1019,11 +1149,6 @@ func (r *RAria2) writeBatchFile(content []byte) error {
 	logrus.Infof("wrote aria2 batch file with %d download entries to %s",
 		len(r.downloadEntries), r.WriteBatch)
 	return nil
-}
-
-type aria2URLEntry struct {
-	URL string
-	Dir string
 }
 
 func getLinks(originalUrl *url.URL, body io.ReadCloser) ([]string, error) {
