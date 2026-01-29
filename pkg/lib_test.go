@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -27,6 +28,30 @@ func TestSameUrl(t *testing.T) {
 	assert.True(t, SameUrl(firstUrl, thirdUrl))
 	assert.True(t, SameUrl(secondUrl, thirdUrl))
 	assert.False(t, SameUrl(firstUrl, fourthUrl))
+}
+
+func runTestClient(t *testing.T, client *RAria2) error {
+	t.Helper()
+	return client.RunWithContext(context.Background())
+}
+
+type mockSink struct {
+	writeFn func(aria2URLEntry) error
+	closeFn func() error
+}
+
+func (m *mockSink) Write(entry aria2URLEntry) error {
+	if m.writeFn != nil {
+		return m.writeFn(entry)
+	}
+	return nil
+}
+
+func (m *mockSink) Close() error {
+	if m.closeFn != nil {
+		return m.closeFn()
+	}
+	return nil
 }
 
 func TestPathAllowedAcceptAndReject(t *testing.T) {
@@ -134,7 +159,7 @@ func TestRun_FailsWhenAria2Missing(t *testing.T) {
 	}
 
 	client := &RAria2{}
-	err := client.Run()
+	err := runTestClient(t, client)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "aria2c is required")
 }
@@ -173,7 +198,7 @@ func TestRun_PathFilters(t *testing.T) {
 	client.OutputPath = tempDir(t)
 	client.AcceptPathRegex = []*regexp.Regexp{regexp.MustCompile(`^/files/`)}
 
-	err = client.Run()
+	err = runTestClient(t, client)
 	assert.Nil(t, err)
 	if assert.Len(t, client.downloadEntries, 2) {
 		for _, entry := range client.downloadEntries {
@@ -193,7 +218,7 @@ func TestRun_RespectsMaxDepth(t *testing.T) {
 	client.DryRun = true
 	client.MaxDepth = 0
 
-	err = client.Run()
+	err = client.RunWithContext(context.Background())
 	assert.Nil(t, err)
 	assert.Len(t, client.downloadEntries, 0)
 }
@@ -268,6 +293,40 @@ func TestExecuteBatchDownloadNoEntries(t *testing.T) {
 	assert.NoError(t, r.executeBatchDownload(context.Background(), entries))
 }
 
+func TestExecuteBatchDownloadRespectsSessionSize(t *testing.T) {
+	r := &RAria2{Aria2EntriesPerSession: 2}
+	var sessionWrites []int
+	r.sinkFactory = func(ctx context.Context, _ *RAria2) (downloadSink, error) {
+		sessionWrites = append(sessionWrites, 0)
+		idx := len(sessionWrites) - 1
+		return &mockSink{
+			writeFn: func(aria2URLEntry) error {
+				sessionWrites[idx]++
+				return nil
+			},
+		}, nil
+	}
+
+	entries := make(chan aria2URLEntry, 5)
+	for i := 0; i < 5; i++ {
+		entries <- aria2URLEntry{URL: fmt.Sprintf("https://example.com/file%02d.bin", i)}
+	}
+	close(entries)
+
+	assert.NoError(t, r.executeBatchDownload(context.Background(), entries))
+	assert.Equal(t, []int{2, 2, 1}, sessionWrites)
+}
+
+func TestWaitForRateLimitHonorsInterval(t *testing.T) {
+	r := &RAria2{RateLimit: 2} // 2 requests per second -> 500ms interval
+	r.waitForRateLimit()
+	start := time.Now()
+	r.waitForRateLimit()
+	elapsed := time.Since(start)
+	minInterval := time.Duration(float64(time.Second) / r.RateLimit)
+	assert.GreaterOrEqual(t, elapsed, minInterval-50*time.Millisecond)
+}
+
 func TestGetLinksByUrlFetchesRemoteLinks(t *testing.T) {
 	ts := newFixtureServer()
 	t.Cleanup(ts.Close)
@@ -305,7 +364,7 @@ func TestRun_WithRootFixture(t *testing.T) {
 	client.OutputPath = tempDir(t)
 	client.DryRun = true
 
-	err = client.Run()
+	err = client.RunWithContext(context.Background())
 	assert.Nil(t, err)
 }
 
@@ -321,7 +380,7 @@ func TestRun_FromNestedPath(t *testing.T) {
 	client.MaxConcurrentDownload = 2
 	client.MaxConnectionPerServer = 2
 
-	err = client.Run()
+	err = client.RunWithContext(context.Background())
 	assert.Nil(t, err)
 }
 
@@ -577,7 +636,7 @@ func TestVisitedCachePersistence(t *testing.T) {
 
 	assert.NoError(t, r.saveVisitedCache())
 	fileEntries := readVisitedCache(t, cacheFile)
-	assert.Contains(t, fileEntries, canonicalCacheKey("https://example.com/root/new.bin"))
+	assert.Contains(t, fileEntries, canonicalURL("https://example.com/root/new.bin"))
 }
 
 func writeVisitedCache(t *testing.T, path string, entries []string) {
@@ -631,7 +690,7 @@ func TestWriteBatch(t *testing.T) {
 	content, err := os.ReadFile(r.WriteBatch)
 	assert.NoError(t, err)
 
-	expected := "https://example.com/file1.bin\n  dir=downloads\nhttps://example.com/file2.bin\n"
+	expected := "https://example.com/file1.bin\n  dir=downloads\n\nhttps://example.com/file2.bin\n\n"
 	assert.Equal(t, expected, string(content))
 }
 
@@ -664,14 +723,14 @@ func TestWriteBatchEntryFormatsDir(t *testing.T) {
 	entry := aria2URLEntry{URL: "https://example.com/file.bin", Dir: "out"}
 	assert.NoError(t, writeBatchEntry(writer, entry))
 	assert.NoError(t, writer.Flush())
-	assert.Equal(t, "https://example.com/file.bin\n  dir=out\n", buf.String())
+	assert.Equal(t, "https://example.com/file.bin\n  dir=out\n\n", buf.String())
 
 	buf.Reset()
 	writer.Reset(&buf)
 	entry.Dir = ""
 	assert.NoError(t, writeBatchEntry(writer, entry))
 	assert.NoError(t, writer.Flush())
-	assert.Equal(t, "https://example.com/file.bin\n", buf.String())
+	assert.Equal(t, "https://example.com/file.bin\n\n", buf.String())
 }
 
 func TestBatchFileSinkWritesEntries(t *testing.T) {
@@ -686,7 +745,7 @@ func TestBatchFileSinkWritesEntries(t *testing.T) {
 
 	content, err := os.ReadFile(path)
 	assert.NoError(t, err)
-	assert.Equal(t, "https://example.com/file.bin\n  dir=downloads\n", string(content))
+	assert.Equal(t, "https://example.com/file.bin\n  dir=downloads\n\n", string(content))
 }
 
 func TestAria2SinkStreamsEntries(t *testing.T) {
@@ -715,7 +774,7 @@ func TestAria2SinkStreamsEntries(t *testing.T) {
 
 	content, err := os.ReadFile(capture)
 	assert.NoError(t, err)
-	assert.Equal(t, "https://example.com/file.bin\n  dir=out\n", string(content))
+	assert.Equal(t, "https://example.com/file.bin\n  dir=out\n\n", string(content))
 }
 
 func TestIsSubPath(t *testing.T) {

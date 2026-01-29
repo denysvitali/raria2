@@ -14,7 +14,7 @@ go build .
 ## Usage
 
 ```
-Usage: raria2 [--output OUTPUT] [--dry-run] [--max-connection-per-server CONNECTIONS] [--max-concurrent-downloads DOWNLOADS] [--max-depth DEPTH] [--accept EXT] [--reject EXT] [--accept-filename GLOB] [--reject-filename GLOB] [--case-insensitive-paths] [--accept-path PATTERN] [--reject-path PATTERN] [--visited-cache FILE] [--write-batch FILE] [--http-timeout DURATION] [--user-agent UA] [--rate-limit RATE] URL [-- ARIA2_OPTS...]
+Usage: raria2 [--output OUTPUT] [--dry-run] [--max-connection-per-server CONNECTIONS] [--max-concurrent-downloads DOWNLOADS] [--aria2-session-size SIZE] [--max-depth DEPTH] [--accept EXT] [--reject EXT] [--accept-filename GLOB] [--reject-filename GLOB] [--case-insensitive-paths] [--accept-path PATTERN] [--reject-path PATTERN] [--visited-cache FILE] [--write-batch FILE] [--http-timeout DURATION] [--user-agent UA] [--rate-limit RATE] URL [-- ARIA2_OPTS...]
 
 Positional arguments:
   URL                    The URL from where to fetch the resources from
@@ -30,6 +30,11 @@ Options:
                          Parallel connections per download [default: 5]
   --max-concurrent-downloads, -j
                          Maximum concurrent downloads [default: 5]
+  --aria2-session-size SIZE
+                          Number of links to feed a single aria2 process before
+                          closing stdin and restarting it. 0 keeps a single
+                          session. See "Aria2 stdin bug workaround" below for details.
+                          [default: 0]
   --max-depth DEPTH      Maximum HTML depth to crawl (-1 for unlimited) [default: -1]
   --accept EXT           Comma-separated list(s) of extensions to include (no dot, case-insensitive)
   --reject EXT           Comma-separated list(s) of extensions to exclude
@@ -90,6 +95,15 @@ raria2 --accept-mime 'application/pdf,image/jpeg,image/png' 'https://example.com
 raria2 --reject-mime 'application/octet-stream,application/x-executable,application/zip' 'https://example.com/pub/'
 ```
 
+## Aria2 stdin bug workaround
+
+Aria2 has an open bug ([aria2/aria2#1161](https://github.com/aria2/aria2/issues/1161))
+where downloads fed via stdin might not start until the input stream closes.
+When crawling large trees, use `--aria2-session-size` to periodically close and
+restart aria2 so downloads begin before the crawl finishes. This option only
+applies when streaming URLs directly to aria2 (normal mode), not when
+`--write-batch` is used.
+
 ## Session Management
 
 The `--visited-cache` option allows you to persist visited URLs between runs, enabling resume functionality:
@@ -104,7 +118,9 @@ raria2 --visited-cache=visited.txt 'https://example.com/pub/'
 
 ## Batch File Generation
 
-Use `--write-batch` to create an aria2 input file for manual control:
+Use `--write-batch` to create an aria2 input file for manual control. If you
+hit the aria2 stdin bug (aria2/aria2#1161) on large crawls, combine
+`--aria2-session-size` with `--write-batch` to generate smaller chunks:
 
 ```bash
 # Create batch file without downloading
