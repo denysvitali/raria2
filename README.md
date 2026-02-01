@@ -31,10 +31,11 @@ Options:
   --max-concurrent-downloads, -j
                          Maximum concurrent downloads [default: 5]
   --aria2-session-size SIZE
-                          Number of links to feed a single aria2 process before
-                          closing stdin and restarting it. 0 keeps a single
-                          session. See "Aria2 stdin bug workaround" below for details.
-                          [default: 0]
+                         Number of links to feed a single aria2 process before
+                         closing stdin and restarting it. Defaults to 100 entries;
+                         set to 0 to keep a single session. See "Aria2 stdin bug
+                         workaround" below for details.
+                         [default: 100]
   --max-depth DEPTH      Maximum HTML depth to crawl (-1 for unlimited) [default: -1]
   --accept EXT           Comma-separated list(s) of extensions to include (no dot, case-insensitive)
   --reject EXT           Comma-separated list(s) of extensions to exclude

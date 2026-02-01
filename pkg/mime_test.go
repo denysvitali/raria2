@@ -75,11 +75,10 @@ func TestMimeAllowed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := &RAria2{
-				AcceptMime: tt.acceptMime,
-				RejectMime: tt.rejectMime,
-			}
-			result := r.mimeAllowed(tt.contentType)
+			fm := NewFilterManager(nil)
+			fm.AcceptMime = tt.acceptMime
+			fm.RejectMime = tt.rejectMime
+			result := fm.MimeAllowed(tt.contentType)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -133,10 +132,11 @@ func TestDownloadResource_MimeFiltering(t *testing.T) {
 				url:            baseURL,
 				OutputPath:     outputDir,
 				DryRun:         true,
-				AcceptMime:     tt.acceptMime,
-				RejectMime:     tt.rejectMime,
 				DisableRetries: true,
 			}
+			filters := r.FiltersConfig()
+			filters.AcceptMime = tt.acceptMime
+			filters.RejectMime = tt.rejectMime
 
 			// Create a test server
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -209,9 +209,8 @@ func TestParseMimeArgs(t *testing.T) {
 			// Test parseMimeArgs behavior by creating a test instance
 			// We'll need to import the main package or move this test there
 			// For now, let's test the mimeAllowed function directly with known values
-			r := &RAria2{
-				AcceptMime: tt.expected,
-			}
+			fm := NewFilterManager(nil)
+			fm.AcceptMime = tt.expected
 
 			// Test that the mime filtering works with the expected values
 			if len(tt.expected) > 0 {
@@ -221,7 +220,7 @@ func TestParseMimeArgs(t *testing.T) {
 					firstMime = mime
 					break
 				}
-				assert.True(t, r.mimeAllowed(firstMime))
+				assert.True(t, fm.MimeAllowed(firstMime))
 			}
 		})
 	}
