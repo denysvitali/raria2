@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -88,7 +89,7 @@ func (uc *URLCache) Save() error {
 	uc.cacheMu.Unlock()
 	sort.Strings(keys)
 
-	dir := dirPath(uc.path)
+	dir := filepath.Dir(uc.path)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
@@ -120,13 +121,4 @@ func (uc *URLCache) Save() error {
 	}
 
 	return os.Rename(tmpPath, uc.path)
-}
-
-// dirPath returns the directory part of a file path
-func dirPath(path string) string {
-	lastSlash := strings.LastIndex(path, "/")
-	if lastSlash == -1 {
-		return "."
-	}
-	return path[:lastSlash]
 }

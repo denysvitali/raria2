@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 )
 
 var (
+	backslashToSlash         = strings.NewReplacer("\\", "/", "%5c", "/", "%5C", "/")
 	execCommand              = exec.Command
 	lookPath                 = exec.LookPath
 	defaultDownloadQueueSize = 256
@@ -62,6 +64,27 @@ type RAria2 struct {
 
 	// injectable sink factory (used in tests)
 	sinkFactory func(context.Context, *RAria2) (downloadSink, error)
+}
+
+func safeRelativeOutputPath(urlPath string) (string, bool) {
+	if urlPath == "" {
+		return "", true
+	}
+	// Convert Windows-style separators (literal or percent-encoded) so path.Clean can remove dot segments.
+	urlPath = backslashToSlash.Replace(urlPath)
+	// Normalize as a URL path by forcing a leading slash.
+	// This prevents path.Clean from collapsing away a leading segment (e.g. "host/../x").
+	if !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+	clean := path.Clean(urlPath)
+	if clean == "." || clean == "/" {
+		return "", true
+	}
+	if !strings.HasPrefix(clean, "/") {
+		return "", false
+	}
+	return strings.TrimPrefix(clean, "/"), true
 }
 
 func New(url *url.URL) *RAria2 {
@@ -221,38 +244,22 @@ func (r *RAria2) getLinksByUrlWithContext(ctx context.Context, urlString string)
 		return []string{}, err
 	}
 
-	// First try HEAD request to check if it's HTML
-	req, err := http.NewRequestWithContext(ctx, "HEAD", urlString, nil)
+	isHTML, err := r.IsHtmlPage(urlString)
+	if err != nil {
+		return nil, err
+	}
+	if !isHTML {
+		return nil, errNotHTML
+	}
+
+	// It's HTML, so do a full GET to parse links
+	req, err := http.NewRequestWithContext(ctx, "GET", urlString, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", r.UserAgent)
 
 	var res *http.Response
-	if r.DisableRetries {
-		res, err = r.client().Do(req)
-	} else {
-		res, err = r.client().DoWithRetry(req)
-	}
-	if err != nil {
-		return nil, err
-	}
-	res.Body.Close()
-
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("unexpected status code %d for %s", res.StatusCode, urlString)
-	}
-
-	if !IsHTMLContent(res.Header.Get("Content-Type")) {
-		return nil, errNotHTML
-	}
-
-	// It's HTML, so do a full GET to parse links
-	req, err = http.NewRequestWithContext(ctx, "GET", urlString, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", r.UserAgent)
 
 	if r.DisableRetries {
 		res, err = r.client().Do(req)
@@ -272,8 +279,10 @@ func (r *RAria2) getLinksByUrlWithContext(ctx context.Context, urlString string)
 }
 
 func (r *RAria2) RunWithContext(ctx context.Context) error {
-	if _, err := lookPath("aria2c"); err != nil {
-		return fmt.Errorf("aria2c is required but was not found in PATH: %w", err)
+	if r.WriteBatch == "" && r.sinkFactory == nil {
+		if _, err := lookPath("aria2c"); err != nil {
+			return fmt.Errorf("aria2c is required but was not found in PATH: %w", err)
+		}
 	}
 
 	if err := r.loadVisitedCache(); err != nil {
@@ -401,31 +410,57 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 		return
 	}
 
-	// Check MIME type filtering - need to fetch headers first
-	req, err := http.NewRequest("HEAD", cUrl, nil)
-	if err != nil {
-		logrus.Warnf("[W %d]: unable to create HEAD request for %s: %v", workerId, cUrl, err)
-		return
-	}
-	req.Header.Set("User-Agent", r.UserAgent)
+	// MIME type filtering
+	if len(filters.AcceptMime) > 0 || len(filters.RejectMime) > 0 {
+		contentType := ""
+		req, err := http.NewRequest("HEAD", cUrl, nil)
+		if err == nil {
+			req.Header.Set("User-Agent", r.UserAgent)
+			var res *http.Response
+			if r.DisableRetries {
+				res, err = r.client().Do(req)
+			} else {
+				res, err = r.client().DoWithRetry(req)
+			}
+			if err == nil {
+				res.Body.Close()
+				if res.StatusCode >= 200 && res.StatusCode < 300 {
+					contentType = res.Header.Get("Content-Type")
+				}
+			}
+		}
 
-	var res *http.Response
-	if r.DisableRetries {
-		res, err = r.client().Do(req)
-	} else {
-		res, err = r.client().DoWithRetry(req)
-	}
-	if err != nil {
-		logrus.Warnf("[W %d]: unable to fetch headers for %s: %v", workerId, cUrl, err)
-		return
-	}
-	res.Body.Close()
+		// If HEAD failed or did not provide a usable content-type, sniff via a small GET.
+		if contentType == "" {
+			sniffReq, reqErr := http.NewRequest("GET", cUrl, nil)
+			if reqErr != nil {
+				logrus.Warnf("[W %d]: unable to create GET request for MIME sniffing %s: %v", workerId, cUrl, reqErr)
+				return
+			}
+			sniffReq.Header.Set("User-Agent", r.UserAgent)
+			sniffReq.Header.Set("Range", "bytes=0-1023")
+			var sniffRes *http.Response
+			if r.DisableRetries {
+				sniffRes, reqErr = r.client().Do(sniffReq)
+			} else {
+				sniffRes, reqErr = r.client().DoWithRetry(sniffReq)
+			}
+			if reqErr != nil {
+				logrus.Warnf("[W %d]: unable to sniff MIME type for %s: %v", workerId, cUrl, reqErr)
+				return
+			}
+			defer sniffRes.Body.Close()
+			if sniffRes.StatusCode >= 200 && sniffRes.StatusCode < 300 {
+				limitReader := io.LimitReader(sniffRes.Body, 1024)
+				bodyBytes, _ := io.ReadAll(limitReader)
+				contentType = http.DetectContentType(bodyBytes)
+			}
+		}
 
-	// Check MIME type filtering
-	contentType := res.Header.Get("Content-Type")
-	if !filters.MimeAllowed(contentType) {
-		logrus.Debugf("[W %d]: skipping %s due to MIME filter: %s", workerId, cUrl, contentType)
-		return
+		if !filters.MimeAllowed(contentType) {
+			logrus.Debugf("[W %d]: skipping %s due to MIME filter: %s", workerId, cUrl, contentType)
+			return
+		}
 	}
 
 	// Get relative directory
@@ -435,19 +470,36 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 
 	idx := strings.Index(p1, p2)
 	if idx == 0 {
-		outputPath = strings.TrimPrefix(p1, p2)
+		candidate := strings.TrimPrefix(p1, p2)
+		candidate = strings.TrimPrefix(candidate, "/")
+		cleanCandidate, ok := safeRelativeOutputPath(candidate)
+		if !ok {
+			logrus.Warnf("[W %d]: refusing potentially unsafe output path derived from URL %s: %q", workerId, cUrl, candidate)
+			return
+		}
+		outputPath = cleanCandidate
 	} else {
-		outputPath = parsedCUrl.Host + "/" + parsedCUrl.Path
+		cleanPath, ok := safeRelativeOutputPath(parsedCUrl.Path)
+		if !ok {
+			logrus.Warnf("[W %d]: refusing potentially unsafe output path derived from URL %s: %q", workerId, cUrl, parsedCUrl.Path)
+			return
+		}
+		if cleanPath == "" {
+			outputPath = parsedCUrl.Host
+		} else {
+			outputPath = parsedCUrl.Host + "/" + cleanPath
+		}
 	}
-
-	// Safety: ensure outputPath doesn't start with "/" to prevent path traversal
-	outputPath = strings.TrimPrefix(outputPath, "/")
 
 	if r.DryRun {
 		logrus.Infof("[W %d]: dry run: downloading %s to %s", workerId, cUrl, outputPath)
 	}
 
-	outputDir := filepath.Join(r.OutputPath, filepath.Dir(outputPath))
+	dirPart := path.Dir(outputPath)
+	if dirPart == "." {
+		dirPart = ""
+	}
+	outputDir := filepath.Join(r.OutputPath, filepath.FromSlash(dirPart))
 	if err := r.ensureOutputDir(workerId, outputDir); err != nil {
 		logrus.Warnf("unable to create %v: %v", outputDir, err)
 		return

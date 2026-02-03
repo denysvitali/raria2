@@ -69,14 +69,18 @@ func TestDirPath(t *testing.T) {
 	cases := map[string]string{
 		"file.txt":            ".",
 		"dir/file.txt":        "dir",
-		"nested/dir/file.txt": "nested/dir",
+		"nested/dir/file.txt": filepath.FromSlash("nested/dir"),
 		"":                    ".",
 		"single/":             "single",
 	}
+	if os.PathSeparator == '\\' {
+		cases[`dir\\file.txt`] = "dir"
+		cases[`nested\\dir\\file.txt`] = filepath.FromSlash("nested/dir")
+	}
 
 	for input, expected := range cases {
-		if got := dirPath(input); got != expected {
-			t.Fatalf("dirPath(%q) = %q, want %q", input, got, expected)
+		if got := filepath.Dir(input); got != expected {
+			t.Fatalf("filepath.Dir(%q) = %q, want %q", input, got, expected)
 		}
 	}
 }

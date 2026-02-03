@@ -304,6 +304,49 @@ func TestRun_FailsWhenAria2Missing(t *testing.T) {
 	assert.Contains(t, err.Error(), "aria2c is required")
 }
 
+func TestRun_DoesNotRequireAria2WhenWriteBatchIsSet(t *testing.T) {
+	oldLookPath := lookPath
+	defer func() { lookPath = oldLookPath }()
+	lookPath = func(string) (string, error) {
+		return "", fmt.Errorf("not found")
+	}
+
+	tmp := tempDir(t)
+	client := &RAria2{
+		url:        mustParseURL(t, "https://example.com/root/"),
+		OutputPath: tmp,
+		WriteBatch: filepath.Join(tmp, "batch.txt"),
+		DryRun:     true,
+		urlCache:   NewURLCache(""),
+	}
+	client.FiltersConfig()
+
+	err := runTestClient(t, client)
+	assert.NoError(t, err)
+}
+
+func TestRun_DoesNotRequireAria2WhenSinkFactoryIsInjected(t *testing.T) {
+	oldLookPath := lookPath
+	defer func() { lookPath = oldLookPath }()
+	lookPath = func(string) (string, error) {
+		return "", fmt.Errorf("not found")
+	}
+
+	client := &RAria2{
+		url:        mustParseURL(t, "https://example.com/root/"),
+		OutputPath: tempDir(t),
+		DryRun:     true,
+		urlCache:   NewURLCache(""),
+	}
+	client.FiltersConfig()
+	client.sinkFactory = func(ctx context.Context, _ *RAria2) (downloadSink, error) {
+		return &mockSink{}, nil
+	}
+
+	err := runTestClient(t, client)
+	assert.NoError(t, err)
+}
+
 func newTestRAria2ForHTTP(t *testing.T, handler http.HandlerFunc) (*RAria2, string) {
 	t.Helper()
 	server := httptest.NewServer(handler)

@@ -2,6 +2,7 @@ package raria2
 
 import (
 	"net/url"
+	"path"
 	"strings"
 )
 
@@ -41,10 +42,20 @@ func canonicalURL(raw string) string {
 	// Always strip fragments
 	parsed.Fragment = ""
 
-	// Normalize path - but preserve root path
+	// Normalize path by cleaning dot-segments.
+	// Note: this also collapses multiple slashes.
 	if parsed.Path == "" {
 		parsed.Path = "/"
-	} else if parsed.Path != "/" && strings.HasSuffix(parsed.Path, "/") {
+	} else {
+		parsed.Path = path.Clean(parsed.Path)
+		if parsed.Path == "." {
+			parsed.Path = "/"
+		}
+	}
+	parsed.RawPath = ""
+
+	// Normalize path - but preserve root path
+	if parsed.Path != "/" && strings.HasSuffix(parsed.Path, "/") {
 		// Remove trailing slashes for consistency (except root)
 		parsed.Path = strings.TrimSuffix(parsed.Path, "/")
 	}
