@@ -14,7 +14,7 @@ go build .
 ## Usage
 
 ```
-Usage: raria2 [--output OUTPUT] [--dry-run] [--max-connection-per-server CONNECTIONS] [--max-concurrent-downloads DOWNLOADS] [--aria2-session-size SIZE] [--max-depth DEPTH] [--accept EXT] [--reject EXT] [--accept-filename GLOB] [--reject-filename GLOB] [--case-insensitive-paths] [--accept-path PATTERN] [--reject-path PATTERN] [--visited-cache FILE] [--write-batch FILE] [--http-timeout DURATION] [--user-agent UA] [--rate-limit RATE] URL [-- ARIA2_OPTS...]
+Usage: raria2 [--output OUTPUT] [--dry-run] [--max-connection-per-server CONNECTIONS] [--max-concurrent-downloads DOWNLOADS] [--threads THREADS] [--aria2-session-size SIZE] [--max-depth DEPTH] [--accept EXT] [--reject EXT] [--accept-filename GLOB] [--reject-filename GLOB] [--case-insensitive-paths] [--accept-path PATTERN] [--reject-path PATTERN] [--visited-cache FILE] [--write-batch FILE] [--http-timeout DURATION] [--user-agent UA] [--rate-limit RATE] URL [-- ARIA2_OPTS...]
 
 Positional arguments:
   URL                    The URL from where to fetch the resources from
@@ -30,6 +30,8 @@ Options:
                          Parallel connections per download [default: 5]
   --max-concurrent-downloads, -j
                          Maximum concurrent downloads [default: 5]
+  --threads THREADS, -w THREADS
+                         Concurrent crawler threads [default: 5]
   --aria2-session-size SIZE
                          Number of links to feed a single aria2 process before
                          closing stdin and restarting it. Defaults to 100 entries;
@@ -64,8 +66,8 @@ Options:
 # dry run mirroring into host/path structure automatically
 raria2 -d 'https://proof.ovh.net/files/' -- --max-download-limit=1M
 
-# explicitly setting output directory and concurrency knobs
-raria2 -d -o output -x 10 -j 8 'https://mirror.nforce.com/pub/speedtests/' -- --max-download-limit=1M
+# explicitly setting output directory and concurrency knobs (crawler + aria2)
+raria2 -d -o output -x 10 -j 8 -w 12 'https://mirror.nforce.com/pub/speedtests/' -- --max-download-limit=1M
 
 # customize the HTTP timeout (here: 2 minutes)
 raria2 --http-timeout=2m 'https://example.com/pub/'

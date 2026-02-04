@@ -25,13 +25,36 @@ var (
 	execCommand              = exec.Command
 	lookPath                 = exec.LookPath
 	defaultDownloadQueueSize = 256
+	defaultCrawlerQueueSize  = 128
 )
+
+type crawlEntry struct {
+	url   string
+	depth int
+}
+
+// subDownloadUrls is kept for backward compatibility with older tests that expect
+// a synchronous crawl starting from a single URL.
+func (r *RAria2) subDownloadUrls(ctx context.Context, workerId int, startURL string) {
+	queue := []crawlEntry{{url: startURL, depth: 0}}
+	enqueue := func(entry crawlEntry) bool {
+		queue = append(queue, entry)
+		return true
+	}
+
+	for len(queue) > 0 {
+		entry := queue[0]
+		queue = queue[1:]
+		r.processCrawlEntry(ctx, workerId, entry, enqueue)
+	}
+}
 
 type RAria2 struct {
 	url                    *url.URL
 	MaxConnectionPerServer int
 	MaxConcurrentDownload  int
 	MaxDepth               int
+	Threads                int
 	OutputPath             string
 	Aria2AfterURLArgs      []string
 	Aria2EntriesPerSession int
@@ -93,6 +116,7 @@ func New(url *url.URL) *RAria2 {
 		MaxConnectionPerServer: 5,
 		MaxConcurrentDownload:  5,
 		MaxDepth:               -1,
+		Threads:                5,
 		HTTPTimeout:            30 * time.Second,
 		urlCache:               NewURLCache(""), // Will be initialized with path later
 		Filters:                NewFilterManager(url),
@@ -303,7 +327,7 @@ func (r *RAria2) RunWithContext(ctx context.Context) error {
 		downloadErrCh <- r.executeBatchDownload(ctx, entriesCh)
 	}()
 
-	r.subDownloadUrls(ctx, 0, r.url.String())
+	r.crawl(ctx)
 
 	close(entriesCh)
 	r.downloadEntriesCh = nil
@@ -316,74 +340,117 @@ func (r *RAria2) RunWithContext(ctx context.Context) error {
 	return downloadErr
 }
 
-func (r *RAria2) subDownloadUrls(ctx context.Context, workerId int, startURL string) {
-	type crawlEntry struct {
-		url   string
-		depth int
+func (r *RAria2) crawl(ctx context.Context) {
+	threads := r.Threads
+	if threads < 1 {
+		threads = 1
+	}
+	queueSize := defaultCrawlerQueueSize
+	if threads*2 > queueSize {
+		queueSize = threads * 2
 	}
 
-	queue := []crawlEntry{{url: startURL, depth: 0}}
-	filters := r.FiltersConfig()
+	entries := make(chan crawlEntry, queueSize)
+	var pending sync.WaitGroup
 
-	for len(queue) > 0 {
-		// Check for context cancellation
+	enqueue := func(entry crawlEntry) bool {
 		select {
 		case <-ctx.Done():
-			logrus.Info("Crawling cancelled by context")
-			return
+			return false
 		default:
 		}
+		pending.Add(1)
+		select {
+		case entries <- entry:
+			return true
+		case <-ctx.Done():
+			pending.Done()
+			return false
+		}
+	}
 
-		entry := queue[0]
-		queue = queue[1:]
-		cUrl := entry.url
-		parsedURL, err := url.Parse(cUrl)
+	if !enqueue(crawlEntry{url: r.url.String(), depth: 0}) {
+		close(entries)
+		return
+	}
+
+	var workers sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		workers.Add(1)
+		go func(id int) {
+			defer workers.Done()
+			for entry := range entries {
+				r.processCrawlEntry(ctx, id, entry, enqueue)
+				pending.Done()
+			}
+		}(i)
+	}
+
+	go func() {
+		pending.Wait()
+		close(entries)
+	}()
+
+	workers.Wait()
+}
+
+func (r *RAria2) processCrawlEntry(ctx context.Context, workerId int, entry crawlEntry, enqueue func(crawlEntry) bool) {
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	filters := r.FiltersConfig()
+	cUrl := entry.url
+	parsedURL, err := url.Parse(cUrl)
+	if err != nil {
+		logrus.Warnf("skipping invalid URL %s: %v", cUrl, err)
+		return
+	}
+
+	if !filters.PathAllowed(parsedURL) {
+		logrus.Debugf("path filters skipped %s", cUrl)
+		return
+	}
+
+	if r.RespectRobots && !r.urlAllowedByRobots(parsedURL) {
+		logrus.Debugf("robots.txt disallowed %s", cUrl)
+		return
+	}
+
+	if !r.markVisited(cUrl) {
+		logrus.WithField("url", cUrl).Debug("skipping already visited")
+		return
+	}
+
+	newLinks, err := r.getLinksByUrlWithContext(ctx, cUrl)
+	if err != nil {
+		if errors.Is(err, errNotHTML) {
+			r.downloadResource(workerId, cUrl)
+			return
+		}
+		logrus.Warnf("unable to fetch %v: %v", cUrl, err)
+		return
+	}
+
+	nextDepth := entry.depth + 1
+	if r.MaxDepth >= 0 && nextDepth > r.MaxDepth {
+		return
+	}
+
+	for _, link := range newLinks {
+		parsedLink, err := url.Parse(link)
 		if err != nil {
-			logrus.Warnf("skipping invalid URL %s: %v", cUrl, err)
+			logrus.Debugf("skipping invalid discovered URL %s: %v", link, err)
 			continue
 		}
-
-		if !filters.PathAllowed(parsedURL) {
-			logrus.Debugf("path filters skipped %s", cUrl)
+		if !filters.PathAllowed(parsedLink) {
+			logrus.Debugf("path filters skipped %s", link)
 			continue
 		}
-
-		if r.RespectRobots && !r.urlAllowedByRobots(parsedURL) {
-			logrus.Debugf("robots.txt disallowed %s", cUrl)
-			continue
-		}
-
-		if !r.markVisited(cUrl) {
-			logrus.WithField("url", cUrl).Debug("skipping already visited")
-			continue
-		}
-
-		newLinks, err := r.getLinksByUrlWithContext(ctx, cUrl)
-		if err != nil {
-			if errors.Is(err, errNotHTML) {
-				r.downloadResource(workerId, cUrl)
-				continue
-			}
-			logrus.Warnf("unable to fetch %v: %v", cUrl, err)
-			continue
-		}
-
-		nextDepth := entry.depth + 1
-		if r.MaxDepth >= 0 && nextDepth > r.MaxDepth {
-			continue
-		}
-
-		for _, link := range newLinks {
-			parsedLink, err := url.Parse(link)
-			if err != nil {
-				logrus.Debugf("skipping invalid discovered URL %s: %v", link, err)
-				continue
-			}
-			if !filters.PathAllowed(parsedLink) {
-				logrus.Debugf("path filters skipped %s", link)
-				continue
-			}
-			queue = append(queue, crawlEntry{url: link, depth: nextDepth})
+		if !enqueue(crawlEntry{url: link, depth: nextDepth}) {
+			logrus.Debugf("skipping enqueue for %s due to context cancellation", link)
 		}
 	}
 }
