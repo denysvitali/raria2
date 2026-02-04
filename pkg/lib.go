@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -350,8 +351,12 @@ func (r *RAria2) crawl(ctx context.Context) {
 		queueSize = threads * 2
 	}
 
-	entries := make(chan crawlEntry, queueSize)
-	var pending sync.WaitGroup
+	inbox := make(chan crawlEntry, queueSize)
+	work := make(chan crawlEntry, threads)
+
+	var pending atomic.Int64
+	doneCh := make(chan struct{})
+	var doneOnce sync.Once
 
 	enqueue := func(entry crawlEntry) bool {
 		select {
@@ -359,37 +364,61 @@ func (r *RAria2) crawl(ctx context.Context) {
 			return false
 		default:
 		}
+
 		pending.Add(1)
 		select {
-		case entries <- entry:
+		case inbox <- entry:
 			return true
 		case <-ctx.Done():
-			pending.Done()
+			if pending.Add(-1) == 0 {
+				doneOnce.Do(func() { close(doneCh) })
+			}
 			return false
 		}
 	}
 
 	if !enqueue(crawlEntry{url: r.url.String(), depth: 0}) {
-		close(entries)
+		close(work)
 		return
 	}
+
+	go func() {
+		defer close(work)
+		queue := make([]crawlEntry, 0, queueSize)
+		for {
+			var out chan crawlEntry
+			var next crawlEntry
+			if len(queue) > 0 {
+				out = work
+				next = queue[0]
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-doneCh:
+				return
+			case entry := <-inbox:
+				queue = append(queue, entry)
+			case out <- next:
+				queue = queue[1:]
+			}
+		}
+	}()
 
 	var workers sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		workers.Add(1)
 		go func(id int) {
 			defer workers.Done()
-			for entry := range entries {
+			for entry := range work {
 				r.processCrawlEntry(ctx, id, entry, enqueue)
-				pending.Done()
+				if pending.Add(-1) == 0 {
+					doneOnce.Do(func() { close(doneCh) })
+				}
 			}
 		}(i)
 	}
-
-	go func() {
-		pending.Wait()
-		close(entries)
-	}()
 
 	workers.Wait()
 }
