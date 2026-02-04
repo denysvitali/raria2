@@ -21,6 +21,7 @@ var args struct {
 	Output                 string        `arg:"-o" help:"Output directory (defaults to host/path derived from the URL)"`
 	DryRun                 bool          `arg:"-d,--dry-run" help:"Dry Run" default:"false"`
 	Url                    string        `arg:"positional" help:"The URL from where to fetch the resources from"`
+	LogLevel               string        `arg:"--log-level" help:"Log level (panic,fatal,error,warn,info,debug,trace)" default:"info"`
 	MaxConnectionPerServer int           `arg:"-x,--max-connection-per-server" help:"Parallel connections per download" default:"5"`
 	MaxConcurrentDownload  int           `arg:"-j,--max-concurrent-downloads" help:"Maximum concurrent downloads" default:"5"`
 	Threads                int           `arg:"-w,--threads" help:"Concurrent crawler threads" default:"5"`
@@ -46,6 +47,12 @@ var args struct {
 
 func main() {
 	arg.MustParse(&args)
+
+	level, err := logrus.ParseLevel(args.LogLevel)
+	if err != nil {
+		logrus.Fatalf("invalid log level %q: %v", args.LogLevel, err)
+	}
+	logrus.SetLevel(level)
 
 	if args.Url == "" {
 		logrus.Fatalf("please provide an URL (version: %s)", version)

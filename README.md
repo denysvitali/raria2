@@ -16,7 +16,7 @@ go build .
 ## Usage
 
 ```
-Usage: raria2 [--output OUTPUT] [--dry-run] [--max-connection-per-server CONNECTIONS] [--max-concurrent-downloads DOWNLOADS] [--threads THREADS] [--aria2-session-size SIZE] [--max-depth DEPTH] [--accept EXT] [--reject EXT] [--accept-filename GLOB] [--reject-filename GLOB] [--case-insensitive-paths] [--accept-path PATTERN] [--reject-path PATTERN] [--visited-cache FILE] [--write-batch FILE] [--http-timeout DURATION] [--user-agent UA] [--rate-limit RATE] URL [-- ARIA2_OPTS...]
+Usage: raria2 [--output OUTPUT] [--dry-run] [--max-connection-per-server CONNECTIONS] [--max-concurrent-downloads DOWNLOADS] [--threads THREADS] [--aria2-session-size SIZE] [--max-depth DEPTH] [--accept EXT] [--reject EXT] [--accept-filename GLOB] [--reject-filename GLOB] [--case-insensitive-paths] [--accept-path PATTERN] [--reject-path PATTERN] [--visited-cache FILE] [--write-batch FILE] [--http-timeout DURATION] [--user-agent UA] [--log-level LEVEL] [--rate-limit RATE] URL [-- ARIA2_OPTS...]
 
 Positional arguments:
   URL                    The URL from where to fetch the resources from
@@ -54,6 +54,7 @@ Options:
   --http-timeout DURATION
                          HTTP client timeout as Go duration string (e.g. 30s, 2m) [default: 30s]
   --user-agent UA         Custom User-Agent string [default: raria2/1.0]
+  --log-level LEVEL       Log level (panic,fatal,error,warn,info,debug,trace) [default: info]
   --rate-limit RATE       Rate limit for HTTP requests (requests per second) [default: 0]
   --respect-robots        Respect robots.txt when crawling [default: false]
   --accept-mime TYPES     Comma-separated list of MIME types to include

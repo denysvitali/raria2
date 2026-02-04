@@ -87,6 +87,9 @@ type RAria2 struct {
 	sinkFactory func(context.Context, *RAria2) (downloadSink, error)
 
 	ftpList func(context.Context, *url.URL) ([]ftpListingEntry, error)
+
+	ftpConnMu    sync.Mutex
+	ftpConnCache map[string]*ftpConnEntry
 }
 
 func safeRelativeOutputPath(urlPath string) (string, bool) {
@@ -171,6 +174,7 @@ func (r *RAria2) ensureOutputPath() error {
 var errNotHTML = errors.New("content is not HTML")
 
 func (r *RAria2) RunWithContext(ctx context.Context) error {
+	defer r.ftpConnCacheCloseAll()
 	if r.WriteBatch == "" && r.sinkFactory == nil {
 		if _, err := lookPath("aria2c"); err != nil {
 			return fmt.Errorf("aria2c is required but was not found in PATH: %w", err)

@@ -2,14 +2,11 @@ package raria2
 
 import (
 	"context"
-	"crypto/tls"
-	"net"
 	"net/url"
 	"path"
 	"strings"
 
 	"github.com/jlaffaye/ftp"
-	"github.com/sirupsen/logrus"
 )
 
 type ftpListingEntry struct {
@@ -52,56 +49,32 @@ func (r *RAria2) ftpListEntries(ctx context.Context, u *url.URL) ([]ftpListingEn
 		return r.ftpList(ctx, u)
 	}
 
-	host := u.Hostname()
-	port := u.Port()
-	if port == "" {
-		if strings.ToLower(u.Scheme) == "ftps" {
-			port = "990"
-		} else {
-			port = "21"
-		}
-	}
-	addr := net.JoinHostPort(host, port)
-
-	options := []ftp.DialOption{ftp.DialWithContext(ctx), ftp.DialWithTimeout(r.HTTPTimeout)}
-	if strings.ToLower(u.Scheme) == "ftps" {
-		options = append(options, ftp.DialWithTLS(&tls.Config{ServerName: host}))
-	}
-
-	conn, err := ftp.Dial(addr, options...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if quitErr := conn.Quit(); quitErr != nil {
-			logrus.WithError(quitErr).Debug("failed to close FTP connection")
-		}
-	}()
-
-	user := "anonymous"
-	pass := "anonymous"
-	if u.User != nil {
-		user = u.User.Username()
-		if p, ok := u.User.Password(); ok {
-			pass = p
-		} else {
-			pass = ""
-		}
-	}
-
-	if err := conn.Login(user, pass); err != nil {
-		return nil, err
-	}
-
 	listPath := u.Path
 	if listPath == "" {
 		listPath = "/"
 	}
 
-	entries, err := conn.List(listPath)
-	if err != nil && !strings.HasSuffix(listPath, "/") {
-		entries, err = conn.List(listPath + "/")
+	entry, err := r.ftpConnCacheGet(ctx, u)
+	if err != nil {
+		return nil, err
 	}
+
+	entry.mu.Lock()
+	entries, err := entry.list(ctx, listPath)
+	if err != nil {
+		// Treat LIST failures as non-HTML like before, but try one reconnect first.
+		entry.closeLocked()
+		entry.mu.Unlock()
+
+		reEntry, reErr := r.ftpConnCacheGet(ctx, u)
+		if reErr != nil {
+			return nil, errNotHTML
+		}
+		reEntry.mu.Lock()
+		entries, err = reEntry.list(ctx, listPath)
+		reEntry.mu.Unlock()
+	}
+	entry.mu.Unlock()
 	if err != nil {
 		return nil, errNotHTML
 	}
