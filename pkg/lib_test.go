@@ -196,6 +196,68 @@ func TestSubDownloadUrlsRespectsFTPDepthLimit(t *testing.T) {
 	assert.Len(t, r.downloadEntries, 0)
 }
 
+func TestSubDownloadUrlsHTTPSkipsFileTastingWithoutMimeFilters(t *testing.T) {
+	var indexHeadCalls int
+	var indexGetCalls int
+	var fileHeadCalls int
+	var fileGetCalls int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/root/", "/root":
+			switch r.Method {
+			case http.MethodHead:
+				indexHeadCalls++
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				return
+			case http.MethodGet:
+				indexGetCalls++
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`<html><body><a href="file.bin">file</a></body></html>`))
+				return
+			default:
+				t.Fatalf("unexpected method for index: %s", r.Method)
+			}
+		case "/root/file.bin":
+			if r.Method == http.MethodHead {
+				fileHeadCalls++
+			} else if r.Method == http.MethodGet {
+				fileGetCalls++
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	base, _ := url.Parse(server.URL + "/root/")
+	r := newTestClient(base)
+	r.OutputPath = tempDir(t)
+	r.urlCache = NewURLCache("")
+	r.MaxDepth = 1
+
+	r.subDownloadUrls(context.Background(), 0, base.String())
+
+	urls := make([]string, 0, len(r.downloadEntries))
+	for _, e := range r.downloadEntries {
+		urls = append(urls, e.URL)
+	}
+	assert.Contains(t, urls, server.URL+"/root/file.bin")
+
+	assert.GreaterOrEqual(t, indexHeadCalls, 1)
+	assert.GreaterOrEqual(t, indexGetCalls, 1)
+
+	// The file link should be queued without any probing/tasting requests.
+	assert.Equal(t, 0, fileHeadCalls)
+	assert.Equal(t, 0, fileGetCalls)
+}
+
 func TestLoadVisitedCacheInitializesCache(t *testing.T) {
 	tmp := tempDir(t)
 	cacheFile := filepath.Join(tmp, "visited.txt")

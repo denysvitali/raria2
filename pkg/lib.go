@@ -47,6 +47,45 @@ func (r *RAria2) subDownloadUrls(ctx context.Context, workerId int, startURL str
 	}
 }
 
+func isLikelyHTTPFilePath(p string) bool {
+	if p == "" || p == "/" {
+		return false
+	}
+
+	base := path.Base(p)
+	if base == "" || base == "." || base == "/" {
+		return false
+	}
+
+	ext := strings.ToLower(strings.TrimPrefix(path.Ext(base), "."))
+	if ext == "" {
+		return false
+	}
+
+	if len(ext) > 8 {
+		return false
+	}
+
+	allDigits := true
+	for i := 0; i < len(ext); i++ {
+		c := ext[i]
+		if c < '0' || c > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return false
+	}
+
+	switch ext {
+	case "html", "htm", "xhtml", "php", "asp", "aspx", "jsp", "cgi":
+		return false
+	default:
+		return true
+	}
+}
+
 type RAria2 struct {
 	url                    *url.URL
 	MaxConnectionPerServer int
@@ -334,6 +373,16 @@ func (r *RAria2) processCrawlEntry(ctx context.Context, workerId int, entry craw
 			r.downloadResource(workerId, cUrl)
 			return
 		}
+	}
+
+	if (parsedURL.Scheme == "http" || parsedURL.Scheme == "https") &&
+		entry.depth > 0 &&
+		len(filters.AcceptMime) == 0 && len(filters.RejectMime) == 0 &&
+		parsedURL.RawQuery == "" &&
+		!strings.HasSuffix(parsedURL.Path, "/") &&
+		isLikelyHTTPFilePath(parsedURL.Path) {
+		r.downloadResource(workerId, cUrl)
+		return
 	}
 
 	newLinks, err := r.getLinksByUrlWithContext(ctx, cUrl)
