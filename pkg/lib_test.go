@@ -97,6 +97,105 @@ func TestDownloadResourceInvalidURL(t *testing.T) {
 	assert.Len(t, r.downloadEntries, 0)
 }
 
+func TestDownloadResourceFTPQueuesEvenWithMimeFilters(t *testing.T) {
+	r := &RAria2{
+		UserAgent:  "test",
+		OutputPath: tempDir(t),
+		DryRun:     true,
+		url:        mustParseURL(t, "ftp://example.com/root/"),
+		urlCache:   NewURLCache(""),
+	}
+	fm := r.FiltersConfig()
+	fm.AcceptMime = map[string]struct{}{"application/pdf": {}}
+
+	r.downloadResource(0, "ftp://example.com/root/file.bin")
+	if assert.Len(t, r.downloadEntries, 1) {
+		assert.Equal(t, "ftp://example.com/root/file.bin", r.downloadEntries[0].URL)
+	}
+}
+
+func TestSubDownloadUrlsQueuesFTPStartURL(t *testing.T) {
+	base := mustParseURL(t, "ftp://example.com/root/file.bin")
+	r := newTestClient(base)
+	r.OutputPath = tempDir(t)
+	r.urlCache = NewURLCache("")
+	r.ftpList = func(ctx context.Context, u *url.URL) ([]ftpListingEntry, error) {
+		return nil, errNotHTML
+	}
+
+	r.subDownloadUrls(context.Background(), 0, base.String())
+	if assert.Len(t, r.downloadEntries, 1) {
+		assert.Equal(t, base.String(), r.downloadEntries[0].URL)
+	}
+}
+
+func TestSubDownloadUrlsRecursivelyCrawlsFTPDirectory(t *testing.T) {
+	base := mustParseURL(t, "ftp://example.com/root/")
+	r := newTestClient(base)
+	r.OutputPath = tempDir(t)
+	r.urlCache = NewURLCache("")
+	r.MaxDepth = -1
+	r.ftpList = func(ctx context.Context, u *url.URL) ([]ftpListingEntry, error) {
+		switch u.Path {
+		case "/root/", "/root":
+			return []ftpListingEntry{{name: "file1.bin"}, {name: "sub", isDir: true}}, nil
+		case "/root/sub/", "/root/sub":
+			return []ftpListingEntry{{name: "file2.bin"}}, nil
+		default:
+			return nil, errNotHTML
+		}
+	}
+
+	r.subDownloadUrls(context.Background(), 0, base.String())
+	urls := make([]string, 0, len(r.downloadEntries))
+	for _, e := range r.downloadEntries {
+		urls = append(urls, e.URL)
+	}
+	assert.Contains(t, urls, "ftp://example.com/root/file1.bin")
+	assert.Contains(t, urls, "ftp://example.com/root/sub/file2.bin")
+}
+
+func TestSubDownloadUrlsFTPSkipsFileTastingWithoutMimeFilters(t *testing.T) {
+	base := mustParseURL(t, "ftp://example.com/root/")
+	r := newTestClient(base)
+	r.OutputPath = tempDir(t)
+	r.urlCache = NewURLCache("")
+	r.MaxDepth = -1
+
+	var fileListCalls int
+	r.ftpList = func(ctx context.Context, u *url.URL) ([]ftpListingEntry, error) {
+		switch u.Path {
+		case "/root/", "/root":
+			return []ftpListingEntry{{name: "file1.bin"}, {name: "sub", isDir: true}}, nil
+		case "/root/sub/", "/root/sub":
+			return []ftpListingEntry{{name: "file2.bin"}}, nil
+		case "/root/file1.bin", "/root/sub/file2.bin":
+			fileListCalls++
+			return nil, errNotHTML
+		default:
+			return nil, errNotHTML
+		}
+	}
+
+	r.subDownloadUrls(context.Background(), 0, base.String())
+	assert.Equal(t, 0, fileListCalls)
+	assert.Len(t, r.downloadEntries, 2)
+}
+
+func TestSubDownloadUrlsRespectsFTPDepthLimit(t *testing.T) {
+	base := mustParseURL(t, "ftp://example.com/root/")
+	r := newTestClient(base)
+	r.OutputPath = tempDir(t)
+	r.urlCache = NewURLCache("")
+	r.MaxDepth = 0
+	r.ftpList = func(ctx context.Context, u *url.URL) ([]ftpListingEntry, error) {
+		return []ftpListingEntry{{name: "file1.bin"}, {name: "sub", isDir: true}}, nil
+	}
+
+	r.subDownloadUrls(context.Background(), 0, base.String())
+	assert.Len(t, r.downloadEntries, 0)
+}
+
 func TestLoadVisitedCacheInitializesCache(t *testing.T) {
 	tmp := tempDir(t)
 	cacheFile := filepath.Join(tmp, "visited.txt")

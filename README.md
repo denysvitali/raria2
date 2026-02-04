@@ -5,6 +5,8 @@ A wrapper for [aria2](https://aria2.github.io/) to mirror open directories.
 This CLI tool tries to emulate the same behavior of `wget --recursive`, but with a couple of filters,
 checks and caching and by using aria2c to perform the download of resources.
 
+The crawler/link extraction works on HTTP(S) directory listings and HTML pages; individual resources can be downloaded from any scheme supported by aria2 (e.g. HTTP(S), FTP/FTPS).
+
 ## Compile
 
 ```

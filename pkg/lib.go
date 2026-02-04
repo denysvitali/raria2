@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -16,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
 	"github.com/sirupsen/logrus"
 	"github.com/temoto/robotstxt"
 )
@@ -88,6 +85,8 @@ type RAria2 struct {
 
 	// injectable sink factory (used in tests)
 	sinkFactory func(context.Context, *RAria2) (downloadSink, error)
+
+	ftpList func(context.Context, *url.URL) ([]ftpListingEntry, error)
 }
 
 func safeRelativeOutputPath(urlPath string) (string, bool) {
@@ -169,139 +168,7 @@ func (r *RAria2) ensureOutputPath() error {
 	return nil
 }
 
-func (r *RAria2) client() *HTTPClient {
-	if r.httpClient != nil {
-		return r.httpClient
-	}
-
-	timeout := r.HTTPTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-
-	r.httpClient = NewHTTPClient(timeout, r.RateLimit)
-	return r.httpClient
-}
-
-func (r *RAria2) IsHtmlPage(urlString string) (bool, error) {
-	// First try HEAD request
-	req, err := http.NewRequest("HEAD", urlString, nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("User-Agent", r.UserAgent)
-
-	var res *http.Response
-	if r.DisableRetries {
-		res, err = r.client().Do(req)
-	} else {
-		res, err = r.client().DoWithRetry(req)
-	}
-	if err != nil {
-		return false, err
-	}
-	defer res.Body.Close()
-
-	// If HEAD fails with 405/403 or missing Content-Type, fall back to GET
-	if res.StatusCode == 405 || res.StatusCode == 403 ||
-		res.Header.Get("Content-Type") == "" {
-
-		// Try GET with Range header first for efficiency
-		req, err = http.NewRequest("GET", urlString, nil)
-		if err != nil {
-			return false, err
-		}
-		req.Header.Set("User-Agent", r.UserAgent)
-		req.Header.Set("Range", "bytes=0-1023")
-		if r.DisableRetries {
-			res, err = r.client().Do(req)
-		} else {
-			res, err = r.client().DoWithRetry(req)
-		}
-		if err != nil {
-			return false, err
-		}
-		defer res.Body.Close()
-
-		// If Range not supported, read first 1KB normally
-		if res.StatusCode == 416 || res.StatusCode == 400 {
-			req, err = http.NewRequest("GET", urlString, nil)
-			if err != nil {
-				return false, err
-			}
-			req.Header.Set("User-Agent", r.UserAgent)
-			if r.DisableRetries {
-				res, err = r.client().Do(req)
-			} else {
-				res, err = r.client().DoWithRetry(req)
-			}
-			if err != nil {
-				return false, err
-			}
-			defer res.Body.Close()
-		}
-
-		// For successful GET (either Range or full), read first 1KB to detect content type
-		if res.StatusCode >= 200 && res.StatusCode < 300 {
-			limitReader := io.LimitReader(res.Body, 1024)
-			bodyBytes, _ := io.ReadAll(limitReader)
-			contentType := http.DetectContentType(bodyBytes)
-			return IsHTMLContent(contentType), nil
-		}
-	}
-
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return false, fmt.Errorf("unexpected status code %d for %s", res.StatusCode, urlString)
-	}
-
-	return IsHTMLContent(res.Header.Get("Content-Type")), nil
-}
-
 var errNotHTML = errors.New("content is not HTML")
-
-func (r *RAria2) getLinksByUrl(urlString string) ([]string, error) {
-	return r.getLinksByUrlWithContext(context.Background(), urlString)
-}
-
-func (r *RAria2) getLinksByUrlWithContext(ctx context.Context, urlString string) ([]string, error) {
-	parsedUrl, err := url.Parse(urlString)
-	if err != nil {
-		return []string{}, err
-	}
-
-	isHTML, err := r.IsHtmlPage(urlString)
-	if err != nil {
-		return nil, err
-	}
-	if !isHTML {
-		return nil, errNotHTML
-	}
-
-	// It's HTML, so do a full GET to parse links
-	req, err := http.NewRequestWithContext(ctx, "GET", urlString, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", r.UserAgent)
-
-	var res *http.Response
-
-	if r.DisableRetries {
-		res, err = r.client().Do(req)
-	} else {
-		res, err = r.client().DoWithRetry(req)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("unexpected status code %d for %s", res.StatusCode, urlString)
-	}
-
-	return getLinks(parsedUrl, res.Body)
-}
 
 func (r *RAria2) RunWithContext(ctx context.Context) error {
 	if r.WriteBatch == "" && r.sinkFactory == nil {
@@ -443,7 +310,7 @@ func (r *RAria2) processCrawlEntry(ctx context.Context, workerId int, entry craw
 		return
 	}
 
-	if r.RespectRobots && !r.urlAllowedByRobots(parsedURL) {
+	if r.RespectRobots && (parsedURL.Scheme == "http" || parsedURL.Scheme == "https") && !r.urlAllowedByRobots(parsedURL) {
 		logrus.Debugf("robots.txt disallowed %s", cUrl)
 		return
 	}
@@ -451,6 +318,18 @@ func (r *RAria2) processCrawlEntry(ctx context.Context, workerId int, entry craw
 	if !r.markVisited(cUrl) {
 		logrus.WithField("url", cUrl).Debug("skipping already visited")
 		return
+	}
+
+	// For FTP(S) we can distinguish directories from files by the trailing slash added
+	// during listing. When no MIME validation is configured, avoid "tasting" files via
+	// additional FTP LIST calls and queue them for download directly.
+	if (parsedURL.Scheme == "ftp" || parsedURL.Scheme == "ftps") &&
+		entry.depth > 0 &&
+		!strings.HasSuffix(parsedURL.Path, "/") {
+		if len(filters.AcceptMime) == 0 && len(filters.RejectMime) == 0 {
+			r.downloadResource(workerId, cUrl)
+			return
+		}
 	}
 
 	newLinks, err := r.getLinksByUrlWithContext(ctx, cUrl)
@@ -507,55 +386,19 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 	}
 
 	// MIME type filtering
+	isHTTP := parsedCUrl.Scheme == "http" || parsedCUrl.Scheme == "https"
 	if len(filters.AcceptMime) > 0 || len(filters.RejectMime) > 0 {
-		contentType := ""
-		req, err := http.NewRequest("HEAD", cUrl, nil)
-		if err == nil {
-			req.Header.Set("User-Agent", r.UserAgent)
-			var res *http.Response
-			if r.DisableRetries {
-				res, err = r.client().Do(req)
-			} else {
-				res, err = r.client().DoWithRetry(req)
-			}
-			if err == nil {
-				res.Body.Close()
-				if res.StatusCode >= 200 && res.StatusCode < 300 {
-					contentType = res.Header.Get("Content-Type")
-				}
-			}
-		}
-
-		// If HEAD failed or did not provide a usable content-type, sniff via a small GET.
-		if contentType == "" {
-			sniffReq, reqErr := http.NewRequest("GET", cUrl, nil)
-			if reqErr != nil {
-				logrus.Warnf("[W %d]: unable to create GET request for MIME sniffing %s: %v", workerId, cUrl, reqErr)
+		if !isHTTP {
+			logrus.Debugf("[W %d]: skipping MIME filtering for non-HTTP(S) URL %s", workerId, cUrl)
+		} else {
+			contentType, ok := r.sniffHTTPContentType(workerId, cUrl)
+			if !ok {
 				return
 			}
-			sniffReq.Header.Set("User-Agent", r.UserAgent)
-			sniffReq.Header.Set("Range", "bytes=0-1023")
-			var sniffRes *http.Response
-			if r.DisableRetries {
-				sniffRes, reqErr = r.client().Do(sniffReq)
-			} else {
-				sniffRes, reqErr = r.client().DoWithRetry(sniffReq)
-			}
-			if reqErr != nil {
-				logrus.Warnf("[W %d]: unable to sniff MIME type for %s: %v", workerId, cUrl, reqErr)
+			if !filters.MimeAllowed(contentType) {
+				logrus.Debugf("[W %d]: skipping %s due to MIME filter: %s", workerId, cUrl, contentType)
 				return
 			}
-			defer sniffRes.Body.Close()
-			if sniffRes.StatusCode >= 200 && sniffRes.StatusCode < 300 {
-				limitReader := io.LimitReader(sniffRes.Body, 1024)
-				bodyBytes, _ := io.ReadAll(limitReader)
-				contentType = http.DetectContentType(bodyBytes)
-			}
-		}
-
-		if !filters.MimeAllowed(contentType) {
-			logrus.Debugf("[W %d]: skipping %s due to MIME filter: %s", workerId, cUrl, contentType)
-			return
 		}
 	}
 
@@ -631,94 +474,6 @@ func (r *RAria2) saveVisitedCache() error {
 	}
 	return r.urlCache.Save()
 }
-
-func (r *RAria2) urlAllowedByRobots(u *url.URL) bool {
-	if !r.RespectRobots {
-		return true
-	}
-
-	robots, err := r.getRobotsData(u.Host)
-	if err != nil {
-		logrus.Debugf("failed to fetch robots.txt for %s: %v", u.Host, err)
-		return true // fail open
-	}
-
-	// Check if URL is allowed for our user agent
-	return robots.TestAgent(u.Path, r.UserAgent)
-}
-
-func (r *RAria2) getRobotsData(host string) (*robotstxt.RobotsData, error) {
-	r.robotsCacheMu.RLock()
-	if r.robotsCache != nil {
-		if cached, ok := r.robotsCache[host]; ok {
-			r.robotsCacheMu.RUnlock()
-			return cached, nil
-		}
-	}
-	r.robotsCacheMu.RUnlock()
-
-	// Fetch robots.txt - try HTTP first, then HTTPS if needed
-	robotsURL := fmt.Sprintf("http://%s/robots.txt", host)
-	req, err := http.NewRequest("GET", robotsURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", r.UserAgent)
-
-	var resp *http.Response
-	if r.DisableRetries {
-		resp, err = r.client().Do(req)
-	} else {
-		resp, err = r.client().DoWithRetry(req)
-	}
-	if err != nil {
-		// Try HTTPS if HTTP fails
-		robotsURL = fmt.Sprintf("https://%s/robots.txt", host)
-		req, err = http.NewRequest("GET", robotsURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("User-Agent", r.UserAgent)
-
-		if r.DisableRetries {
-			resp, err = r.client().Do(req)
-		} else {
-			resp, err = r.client().DoWithRetry(req)
-		}
-		if err != nil {
-			// No robots.txt or error fetching it
-			robotsData := robotstxt.RobotsData{}
-			r.cacheRobotsData(host, &robotsData)
-			return &robotsData, nil
-		}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// No robots.txt or error fetching it
-		robotsData := robotstxt.RobotsData{}
-		r.cacheRobotsData(host, &robotsData)
-		return &robotsData, nil
-	}
-
-	robotsData, err := robotstxt.FromResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-
-	r.cacheRobotsData(host, robotsData)
-	return robotsData, nil
-}
-
-func (r *RAria2) cacheRobotsData(host string, data *robotstxt.RobotsData) {
-	r.robotsCacheMu.Lock()
-	if r.robotsCache == nil {
-		r.robotsCache = make(map[string]*robotstxt.RobotsData)
-	}
-	r.robotsCache[host] = data
-	r.robotsCacheMu.Unlock()
-}
-
 func (r *RAria2) ensureOutputDir(workerId int, dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		if r.DryRun {
@@ -834,38 +589,4 @@ func (r *RAria2) writeBatchFile(content []byte) error {
 	logrus.Infof("wrote aria2 batch file with %d download entries to %s",
 		len(r.downloadEntries), r.WriteBatch)
 	return nil
-}
-
-func getLinks(originalUrl *url.URL, body io.ReadCloser) ([]string, error) {
-	document, err := goquery.NewDocumentFromReader(body)
-	if err != nil {
-		return []string{}, err
-	}
-
-	var urlList []string
-
-	document.Find("a[href]").Each(func(i int, selection *goquery.Selection) {
-		val, exists := selection.Attr("href")
-		if !exists {
-			return
-		}
-
-		aHrefUrl, err := url.Parse(val)
-		if err != nil {
-			logrus.Infof("skipping %v because it is not a valid URL", val)
-			return
-		}
-
-		resolvedUrl := originalUrl.ResolveReference(aHrefUrl)
-
-		if SameUrl(resolvedUrl, originalUrl) {
-			return
-		}
-
-		if IsSubPath(resolvedUrl, originalUrl) {
-			urlList = append(urlList, resolvedUrl.String())
-		}
-	})
-
-	return urlList, nil
 }
