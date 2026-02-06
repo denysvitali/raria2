@@ -1,175 +1,418 @@
 package raria2
 
 import (
-	"bufio"
-	"github.com/PuerkitoBio/goquery"
-	"github.com/sirupsen/logrus"
-	"io"
-	"math"
-	"net/http"
+	"context"
+	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/temoto/robotstxt"
 )
 
-type RAria2 struct {
-	url                       *url.URL
-	ParallelJobs              int
-	ParallelConnectionsPerJob int
-	ConcurrentDownloadsPerJob int
-	OutputPath string
+var (
+	backslashToSlash         = strings.NewReplacer("\\", "/", "%5c", "/", "%5C", "/")
+	execCommand              = exec.Command
+	lookPath                 = exec.LookPath
+	defaultDownloadQueueSize = 256
+	defaultCrawlerQueueSize  = 128
+)
 
-	urlList    []string
-	httpClient *http.Client
+type crawlEntry struct {
+	url   string
+	depth int
+}
+
+// subDownloadUrls is kept for backward compatibility with older tests that expect
+// a synchronous crawl starting from a single URL.
+func (r *RAria2) subDownloadUrls(ctx context.Context, workerId int, startURL string) {
+	queue := []crawlEntry{{url: startURL, depth: 0}}
+	enqueue := func(entry crawlEntry) bool {
+		queue = append(queue, entry)
+		return true
+	}
+
+	for len(queue) > 0 {
+		entry := queue[0]
+		queue = queue[1:]
+		r.processCrawlEntry(ctx, workerId, entry, enqueue)
+	}
+}
+
+func isLikelyHTTPFilePath(p string) bool {
+	if p == "" || p == "/" {
+		return false
+	}
+
+	base := path.Base(p)
+	if base == "" || base == "." || base == "/" {
+		return false
+	}
+
+	ext := strings.ToLower(strings.TrimPrefix(path.Ext(base), "."))
+	if ext == "" {
+		return false
+	}
+
+	if len(ext) > 8 {
+		return false
+	}
+
+	allDigits := true
+	for i := 0; i < len(ext); i++ {
+		c := ext[i]
+		if c < '0' || c > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return false
+	}
+
+	switch ext {
+	case "html", "htm", "xhtml", "php", "asp", "aspx", "jsp", "cgi":
+		return false
+	default:
+		return true
+	}
+}
+
+type RAria2 struct {
+	url                    *url.URL
+	MaxConnectionPerServer int
+	MaxConcurrentDownload  int
+	MaxDepth               int
+	Threads                int
+	OutputPath             string
+	Aria2AfterURLArgs      []string
+	Aria2EntriesPerSession int
+	HTTPTimeout            time.Duration
+	UserAgent              string
+	RateLimit              float64
+	VisitedCachePath       string
+	WriteBatch             string
+	RespectRobots          bool
+	Filters                *FilterManager
+	httpClient             *HTTPClient
+
+	downloadEntries   []aria2URLEntry
+	downloadEntriesMu sync.Mutex
+
+	// Disable retries (useful for testing)
+	DisableRetries bool
 
 	// does not perform any resource download
-	dryRun bool
+	DryRun bool
 
-	// Sync functions
-	wg *sync.WaitGroup
-	urlCache map[string]bool
+	urlCache *URLCache
+
+	// robots.txt cache per host
+	robotsCache   map[string]*robotstxt.RobotsData
+	robotsCacheMu sync.RWMutex
+
+	// channel used to stream download entries to aria2c/batch writer
+	downloadEntriesCh chan aria2URLEntry
+
+	// injectable sink factory (used in tests)
+	sinkFactory func(context.Context, *RAria2) (downloadSink, error)
+
+	ftpList func(context.Context, *url.URL) ([]ftpListingEntry, error)
+
+	ftpConnMu    sync.Mutex
+	ftpConnCache map[string]*ftpConnEntry
+}
+
+func safeRelativeOutputPath(urlPath string) (string, bool) {
+	if urlPath == "" {
+		return "", true
+	}
+	// Convert Windows-style separators (literal or percent-encoded) so path.Clean can remove dot segments.
+	urlPath = backslashToSlash.Replace(urlPath)
+	// Normalize as a URL path by forcing a leading slash.
+	// This prevents path.Clean from collapsing away a leading segment (e.g. "host/../x").
+	if !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+	clean := path.Clean(urlPath)
+	if clean == "." || clean == "/" {
+		return "", true
+	}
+	if !strings.HasPrefix(clean, "/") {
+		return "", false
+	}
+	return strings.TrimPrefix(clean, "/"), true
 }
 
 func New(url *url.URL) *RAria2 {
 	return &RAria2{
-		url:                       url,
-		ParallelJobs:              5,
-		ParallelConnectionsPerJob: 5,
-		ConcurrentDownloadsPerJob: 5,
+		url:                    url,
+		MaxConnectionPerServer: 5,
+		MaxConcurrentDownload:  5,
+		MaxDepth:               -1,
+		Threads:                5,
+		HTTPTimeout:            30 * time.Second,
+		urlCache:               NewURLCache(""), // Will be initialized with path later
+		Filters:                NewFilterManager(url),
 	}
 }
 
-func (r *RAria2) client() *http.Client {
-	if r.httpClient != nil {
-		return r.httpClient
+func (r *RAria2) FiltersConfig() *FilterManager {
+	if r.Filters == nil {
+		r.Filters = NewFilterManager(r.url)
 	}
-
-	r.httpClient = http.DefaultClient
-	return r.httpClient
+	if r.Filters != nil && r.Filters.baseURL == nil {
+		r.Filters.baseURL = r.url
+	}
+	return r.Filters
 }
 
-func (r *RAria2) IsHtmlPage(urlString string) (bool, error){
-	req, err := http.NewRequest("HEAD", urlString, nil)
-	if err != nil {
-		return false, err
+func (r *RAria2) sessionEntryLimit() int {
+	if r.Aria2EntriesPerSession <= 0 {
+		return 0
 	}
-
-	res, err := r.client().Do(req)
-	if err != nil {
-		return false, err
+	if r.WriteBatch != "" {
+		logrus.Warn("--aria2-session-size is ignored when --write-batch is set")
+		return 0
 	}
+	return r.Aria2EntriesPerSession
+}
 
-	contentType := res.Header.Get("Content-Type")
-	contentTypeEntries := strings.Split(contentType, ";")
-	for _, v := range contentTypeEntries {
-		if v == "text/html" {
-			return true, nil
+func (r *RAria2) ensureOutputPath() error {
+	if r.OutputPath == "" {
+		if r.url == nil {
+			return fmt.Errorf("unable to derive output path: source URL is nil")
+		}
+		host := r.url.Host
+		path := strings.Trim(r.url.Path, "/")
+		if host == "" {
+			host = "download"
+		}
+		if path == "" {
+			r.OutputPath = host
+		} else {
+			r.OutputPath = filepath.Join(host, filepath.FromSlash(path))
 		}
 	}
-	return false, nil
-}
-
-func (r *RAria2) getLinksByUrl(urlString string) ([]string, error) {
-	parsedUrl, err := url.Parse(urlString)
-	if err != nil {
-		return []string{}, err
-	}
-
-	req, err := http.NewRequest("GET", urlString, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	res, err := r.client().Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	return getLinks(parsedUrl, res.Body)
-}
-
-func (r *RAria2) Run() error {
-
-	// Check that output path exists
 	if _, err := os.Stat(r.OutputPath); os.IsNotExist(err) {
-		err = os.Mkdir(r.OutputPath, 0755)
-		if err != nil {
+		if err := os.MkdirAll(r.OutputPath, 0o755); err != nil {
 			return err
 		}
 	}
-	dir, _ := os.Getwd()
-	logrus.Infof("pwd: %v", dir)
-	// Fetch the first URL
-	var err error
-	r.urlList, err = r.getLinksByUrl(r.url.String())
-	if err != nil {
+	return nil
+}
+
+var errNotHTML = errors.New("content is not HTML")
+
+func (r *RAria2) RunWithContext(ctx context.Context) error {
+	defer r.ftpConnCacheCloseAll()
+	if r.WriteBatch == "" && r.sinkFactory == nil {
+		if _, err := lookPath("aria2c"); err != nil {
+			return fmt.Errorf("aria2c is required but was not found in PATH: %w", err)
+		}
+	}
+
+	if err := r.loadVisitedCache(); err != nil {
+		return fmt.Errorf("failed loading visited cache: %w", err)
+	}
+
+	if err := r.ensureOutputPath(); err != nil {
 		return err
 	}
+	dir, _ := os.Getwd()
+	logrus.Infof("pwd: %v", dir)
 
-	logrus.Infof("got %d URLs: dividing them into %d jobs", len(r.urlList), r.ParallelJobs)
+	entriesCh := make(chan aria2URLEntry, defaultDownloadQueueSize)
+	downloadErrCh := make(chan error, 1)
+	r.downloadEntriesCh = entriesCh
 
-	jobSplit := int(math.Ceil(float64(float32(len(r.urlList)) / float32(r.ParallelJobs))))
-	r.wg = &sync.WaitGroup{}
+	go func() {
+		downloadErrCh <- r.executeBatchDownload(ctx, entriesCh)
+	}()
 
-	for i := 0; i < r.ParallelJobs; i++ {
-		beginIndex := i * jobSplit
-		endIndex := intMin((i+1) * jobSplit, len(r.urlList))
-		if beginIndex > endIndex {
-			break
+	r.crawl(ctx)
+
+	close(entriesCh)
+	r.downloadEntriesCh = nil
+	downloadErr := <-downloadErrCh
+
+	if err := r.saveVisitedCache(); err != nil {
+		return fmt.Errorf("failed saving visited cache: %w", err)
+	}
+
+	return downloadErr
+}
+
+func (r *RAria2) crawl(ctx context.Context) {
+	threads := r.Threads
+	if threads < 1 {
+		threads = 1
+	}
+	queueSize := defaultCrawlerQueueSize
+	if threads*2 > queueSize {
+		queueSize = threads * 2
+	}
+
+	inbox := make(chan crawlEntry, queueSize)
+	work := make(chan crawlEntry, threads)
+
+	var pending atomic.Int64
+	doneCh := make(chan struct{})
+	var doneOnce sync.Once
+
+	enqueue := func(entry crawlEntry) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
 		}
-		r.wg.Add(1)
-		go r.downloadUrls(i, r.urlList[beginIndex:endIndex])
+
+		pending.Add(1)
+		select {
+		case inbox <- entry:
+			return true
+		case <-ctx.Done():
+			if pending.Add(-1) == 0 {
+				doneOnce.Do(func() { close(doneCh) })
+			}
+			return false
+		}
 	}
 
-	r.wg.Wait()
-
-	return nil
-
-}
-
-func (r *RAria2) downloadUrls(workerId int, urls []string) {
-	// Do some work
-	for _, cUrl := range urls {
-		r.subDownloadUrls(workerId, cUrl)
-	}
-	// End of work
-
-	logrus.Infof("worker %d ended his work (url=%v)", workerId, urls)
-	r.wg.Done()
-}
-
-func (r *RAria2) subDownloadUrls(workerId int, cUrl string) {
-	// Check if cache has already seen this URL
-	if r.urlCache[cUrl] {
-		logrus.Infof("cache hit for %v. won't re-visit", cUrl)
+	if !enqueue(crawlEntry{url: r.url.String(), depth: 0}) {
+		close(work)
 		return
 	}
 
-	// Fetch URLs
-	isHtml, err := r.IsHtmlPage(cUrl)
+	go func() {
+		defer close(work)
+		queue := make([]crawlEntry, 0, queueSize)
+		for {
+			var out chan crawlEntry
+			var next crawlEntry
+			if len(queue) > 0 {
+				out = work
+				next = queue[0]
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-doneCh:
+				return
+			case entry := <-inbox:
+				queue = append(queue, entry)
+			case out <- next:
+				queue = queue[1:]
+			}
+		}
+	}()
+
+	var workers sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		workers.Add(1)
+		go func(id int) {
+			defer workers.Done()
+			for entry := range work {
+				r.processCrawlEntry(ctx, id, entry, enqueue)
+				if pending.Add(-1) == 0 {
+					doneOnce.Do(func() { close(doneCh) })
+				}
+			}
+		}(i)
+	}
+
+	workers.Wait()
+}
+
+func (r *RAria2) processCrawlEntry(ctx context.Context, workerId int, entry crawlEntry, enqueue func(crawlEntry) bool) {
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	filters := r.FiltersConfig()
+	cUrl := entry.url
+	parsedURL, err := url.Parse(cUrl)
 	if err != nil {
-		logrus.Warnf("unable to get %v content type: %v", cUrl, err)
+		logrus.Warnf("skipping invalid URL %s: %v", cUrl, err)
 		return
 	}
 
-	if isHtml {
-		newLinks, err := r.getLinksByUrl(cUrl)
-		if err != nil {
-			logrus.Errorf("error in wid %d: %v", workerId, err)
+	if !filters.PathAllowed(parsedURL) {
+		logrus.Debugf("path filters skipped %s", cUrl)
+		return
+	}
+
+	if r.RespectRobots && (parsedURL.Scheme == "http" || parsedURL.Scheme == "https") && !r.urlAllowedByRobots(parsedURL) {
+		logrus.Debugf("robots.txt disallowed %s", cUrl)
+		return
+	}
+
+	if !r.markVisited(cUrl) {
+		logrus.WithField("url", cUrl).Debug("skipping already visited")
+		return
+	}
+
+	// For FTP(S) we can distinguish directories from files by the trailing slash added
+	// during listing. When no MIME validation is configured, avoid "tasting" files via
+	// additional FTP LIST calls and queue them for download directly.
+	if (parsedURL.Scheme == "ftp" || parsedURL.Scheme == "ftps") &&
+		entry.depth > 0 &&
+		!strings.HasSuffix(parsedURL.Path, "/") {
+		if len(filters.AcceptMime) == 0 && len(filters.RejectMime) == 0 {
+			r.downloadResource(workerId, cUrl)
 			return
 		}
+	}
 
-		for _, link := range newLinks {
-			r.subDownloadUrls(workerId, link)
-		}
-		return
-	} else {
+	if (parsedURL.Scheme == "http" || parsedURL.Scheme == "https") &&
+		entry.depth > 0 &&
+		len(filters.AcceptMime) == 0 && len(filters.RejectMime) == 0 &&
+		parsedURL.RawQuery == "" &&
+		!strings.HasSuffix(parsedURL.Path, "/") &&
+		isLikelyHTTPFilePath(parsedURL.Path) {
 		r.downloadResource(workerId, cUrl)
 		return
+	}
+
+	newLinks, err := r.getLinksByUrlWithContext(ctx, cUrl)
+	if err != nil {
+		if errors.Is(err, errNotHTML) {
+			r.downloadResource(workerId, cUrl)
+			return
+		}
+		logrus.Warnf("unable to fetch %v: %v", cUrl, err)
+		return
+	}
+
+	nextDepth := entry.depth + 1
+	if r.MaxDepth >= 0 && nextDepth > r.MaxDepth {
+		return
+	}
+
+	for _, link := range newLinks {
+		parsedLink, err := url.Parse(link)
+		if err != nil {
+			logrus.Debugf("skipping invalid discovered URL %s: %v", link, err)
+			continue
+		}
+		if !filters.PathAllowed(parsedLink) {
+			logrus.Debugf("path filters skipped %s", link)
+			continue
+		}
+		if !enqueue(crawlEntry{url: link, depth: nextDepth}) {
+			logrus.Debugf("skipping enqueue for %s due to context cancellation", link)
+		}
 	}
 }
 
@@ -180,6 +423,38 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 		return
 	}
 
+	filters := r.FiltersConfig()
+	if !filters.PathAllowed(parsedCUrl) {
+		logrus.Debugf("[W %d]: skipping %s due to path filters", workerId, cUrl)
+		return
+	}
+	if !filters.ExtensionAllowed(parsedCUrl) {
+		logrus.Debugf("[W %d]: skipping %s due to extension filters", workerId, cUrl)
+		return
+	}
+
+	if !filters.FilenameAllowed(parsedCUrl) {
+		logrus.Debugf("[W %d]: skipping %s due to filename filters", workerId, cUrl)
+		return
+	}
+
+	// MIME type filtering
+	isHTTP := parsedCUrl.Scheme == "http" || parsedCUrl.Scheme == "https"
+	if len(filters.AcceptMime) > 0 || len(filters.RejectMime) > 0 {
+		if !isHTTP {
+			logrus.Debugf("[W %d]: skipping MIME filtering for non-HTTP(S) URL %s", workerId, cUrl)
+		} else {
+			contentType, ok := r.sniffHTTPContentType(workerId, cUrl)
+			if !ok {
+				return
+			}
+			if !filters.MimeAllowed(contentType) {
+				logrus.Debugf("[W %d]: skipping %s due to MIME filter: %s", workerId, cUrl, contentType)
+				return
+			}
+		}
+	}
+
 	// Get relative directory
 	var outputPath string
 	p1 := parsedCUrl.Path
@@ -187,149 +462,184 @@ func (r *RAria2) downloadResource(workerId int, cUrl string) {
 
 	idx := strings.Index(p1, p2)
 	if idx == 0 {
-		outputPath = strings.TrimPrefix(p1, p2)
+		candidate := strings.TrimPrefix(p1, p2)
+		candidate = strings.TrimPrefix(candidate, "/")
+		cleanCandidate, ok := safeRelativeOutputPath(candidate)
+		if !ok {
+			logrus.Warnf("[W %d]: refusing potentially unsafe output path derived from URL %s: %q", workerId, cUrl, candidate)
+			return
+		}
+		outputPath = cleanCandidate
 	} else {
-		outputPath = parsedCUrl.Host + "/" + parsedCUrl.Path
+		cleanPath, ok := safeRelativeOutputPath(parsedCUrl.Path)
+		if !ok {
+			logrus.Warnf("[W %d]: refusing potentially unsafe output path derived from URL %s: %q", workerId, cUrl, parsedCUrl.Path)
+			return
+		}
+		if cleanPath == "" {
+			outputPath = parsedCUrl.Host
+		} else {
+			outputPath = parsedCUrl.Host + "/" + cleanPath
+		}
 	}
 
-	if r.dryRun {
+	if r.DryRun {
 		logrus.Infof("[W %d]: dry run: downloading %s to %s", workerId, cUrl, outputPath)
 	}
 
-	outputDir := filepath.Join(r.OutputPath, filepath.Dir(outputPath))
-	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
-		if r.dryRun {
-			logrus.Infof("[W %d]: dry run: creating folder %s", workerId, outputDir)
-		} else {
-			err = os.MkdirAll(outputDir, 0744)
-			if err != nil {
-				logrus.Warnf("unable to create %v: %v", outputDir, err)
-				return
+	dirPart := path.Dir(outputPath)
+	if dirPart == "." {
+		dirPart = ""
+	}
+	outputDir := filepath.Join(r.OutputPath, filepath.FromSlash(dirPart))
+	if err := r.ensureOutputDir(workerId, outputDir); err != nil {
+		logrus.Warnf("unable to create %v: %v", outputDir, err)
+		return
+	}
+
+	entry := aria2URLEntry{URL: cUrl, Dir: outputDir}
+	r.enqueueDownloadEntry(entry)
+	logrus.Infof("[W %d]: queued %s for batch download (dir=%s)", workerId, cUrl, outputDir)
+}
+
+func (r *RAria2) markVisited(u string) bool {
+	if r.urlCache == nil {
+		r.urlCache = NewURLCache("")
+	}
+	return r.urlCache.MarkVisited(u)
+}
+
+func (r *RAria2) loadVisitedCache() error {
+	if r.urlCache == nil {
+		r.urlCache = NewURLCache(r.VisitedCachePath)
+	} else {
+		r.urlCache.path = r.VisitedCachePath
+	}
+	return r.urlCache.Load()
+}
+
+func (r *RAria2) saveVisitedCache() error {
+	if r.urlCache == nil {
+		return nil
+	}
+	if r.urlCache.path == "" {
+		r.urlCache.path = r.VisitedCachePath
+	}
+	return r.urlCache.Save()
+}
+func (r *RAria2) ensureOutputDir(workerId int, dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if r.DryRun {
+			logrus.Infof("[W %d]: dry run: creating folder %s", workerId, dir)
+			return nil
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *RAria2) enqueueDownloadEntry(entry aria2URLEntry) {
+	r.downloadEntriesMu.Lock()
+	defer r.downloadEntriesMu.Unlock()
+	r.downloadEntries = append(r.downloadEntries, entry)
+	if ch := r.downloadEntriesCh; ch != nil {
+		ch <- entry
+	}
+}
+
+func (r *RAria2) executeBatchDownload(ctx context.Context, entries <-chan aria2URLEntry) error {
+	var (
+		sink              downloadSink
+		sinkErr           error
+		entryCount        int
+		sessionEntryCount int
+	)
+
+	sessionLimit := r.sessionEntryLimit()
+	flushSession := func() error {
+		if sink == nil {
+			sessionEntryCount = 0
+			return nil
+		}
+		if err := sink.Close(); err != nil {
+			return err
+		}
+		sink = nil
+		sessionEntryCount = 0
+		return nil
+	}
+
+	for entry := range entries {
+		if sink == nil {
+			sink, sinkErr = r.newDownloadSink(ctx)
+			if sinkErr != nil {
+				return sinkErr
+			}
+		}
+		entryCount++
+		sessionEntryCount++
+		if err := sink.Write(entry); err != nil {
+			_ = flushSession()
+			return err
+		}
+		if sessionLimit > 0 && sessionEntryCount >= sessionLimit {
+			if err := flushSession(); err != nil {
+				return err
 			}
 		}
 	}
 
-	binFile := "aria2c"
-	args := []string{"-x", strconv.Itoa(r.ParallelConnectionsPerJob), "-d", outputDir}
-
-	// cmd
-	if r.dryRun {
-		args = append(args, "--dry-run=true")
+	if entryCount == 0 {
+		logrus.Info("no downloadable resources found")
+		return nil
 	}
 
-	args = append(args, cUrl)
-
-	if r.dryRun {
-		logrus.Infof("cmd: %s %s", binFile, strings.Join(args, " "))
+	if err := flushSession(); err != nil {
+		return err
 	}
 
-	cmd := exec.Command(binFile, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		logrus.Warnf("unable to get stdout for subcommand: %v", err)
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		logrus.Warnf("unable to get stderr for subcommand: %v", err)
-		return
-	}
-	stdoutScanner := bufio.NewScanner(stdout)
-	stderrScanner := bufio.NewScanner(stderr)
-
-	err = cmd.Start()
-
-	for stdoutScanner.Scan() {
-		logrus.Infof("[W %d]: %s reports: %v", workerId, binFile, stdoutScanner.Text())
+	if r.WriteBatch != "" {
+		logrus.Infof("wrote aria2 batch file with %d download entries to %s", entryCount, r.WriteBatch)
 	}
 
-	for stderrScanner.Scan() {
-		logrus.Warnf("[W %d]: %s reports: %v", workerId, binFile, stderrScanner.Text())
-	}
-
-	if err != nil {
-		logrus.Warnf("unable to run %v: %v", binFile, err)
-	}
-
-	err = cmd.Wait()
-
-	if err != nil {
-		logrus.Warnf("unable to wait %v: %v", binFile, err)
-	}
+	return nil
 }
 
-func intMin(a int, b int) int {
-	if a < b {
-		return a
+func (r *RAria2) newDownloadSink(ctx context.Context) (downloadSink, error) {
+	if r.WriteBatch != "" {
+		return newBatchFileSink(r.WriteBatch)
+	}
+	if r.sinkFactory != nil {
+		return r.sinkFactory(ctx, r)
 	}
 
-	if a > b {
-		return b
-	}
+	// Create an Aria2Manager for this operation
+	am := NewAria2Manager()
+	am.MaxConnectionPerServer = r.MaxConnectionPerServer
+	am.MaxConcurrentDownload = r.MaxConcurrentDownload
+	am.Aria2EntriesPerSession = r.Aria2EntriesPerSession
+	am.DryRun = r.DryRun
+	am.Aria2AfterURLArgs = r.Aria2AfterURLArgs
+	am.WriteBatch = r.WriteBatch
+	am.sinkFactory = r.sinkFactory
 
-	return a
+	return newAria2Sink(ctx, am)
 }
 
-func getLinks(originalUrl *url.URL, body io.ReadCloser) ([]string, error) {
-	document, err := goquery.NewDocumentFromReader(body)
-
-	var urlList []string
-
+func (r *RAria2) writeBatchFile(content []byte) error {
+	file, err := os.Create(r.WriteBatch)
 	if err != nil {
-		return urlList, err
+		return fmt.Errorf("failed to create batch file %s: %w", r.WriteBatch, err)
+	}
+	defer closeQuietly(file)
+
+	if _, err := file.Write(content); err != nil {
+		return fmt.Errorf("failed to write batch file %s: %w", r.WriteBatch, err)
 	}
 
-	document.Find("a[href]").Each(func(i int, selection *goquery.Selection) {
-		val, exists := selection.Attr("href")
-		if !exists {
-			return
-		}
-
-		aHrefUrl, err := url.Parse(val)
-		if err != nil {
-			logrus.Infof("skipping %v because it is not a valid URL", val)
-			return
-		}
-		resolvedRefUrl := originalUrl.ResolveReference(aHrefUrl)
-		if SameUrl(resolvedRefUrl, originalUrl) {
-			return
-		}
-
-		if IsSubPath(resolvedRefUrl, originalUrl) {
-			urlList = append(urlList, resolvedRefUrl.String())
-		}
-	})
-
-	return urlList, nil
-}
-
-func IsSubPath(subject *url.URL, of *url.URL) bool {
-	if subject.Host != of.Host {
-		return false
-	}
-
-	if subject.Scheme != of.Scheme {
-		return false
-	}
-
-	return strings.HasPrefix(subject.Path, of.Path)
-}
-
-// An URL is considered to be the same in our context
-// when they share the same hostname and path.
-// In our case, /, /?C=N;O=D, /?C=M;O=A, ... are all considered to be the same URL.
-func SameUrl(a *url.URL, b *url.URL) bool {
-	if a.Host != b.Host {
-		return false
-	}
-
-	if a.Path != b.Path {
-		return false
-	}
-
-	if a.Port() != b.Port() {
-		return false
-	}
-
-	return true
+	logrus.Infof("wrote aria2 batch file with %d download entries to %s",
+		len(r.downloadEntries), r.WriteBatch)
+	return nil
 }
