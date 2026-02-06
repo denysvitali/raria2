@@ -51,7 +51,7 @@ func (uc *URLCache) Load() error {
 		}
 		return err
 	}
-	defer file.Close()
+	defer closeQuietly(file)
 
 	scanner := bufio.NewScanner(file)
 	var entries []string
@@ -105,13 +105,13 @@ func (uc *URLCache) Save() error {
 	writer := bufio.NewWriter(file)
 	for _, key := range keys {
 		if _, err := fmt.Fprintln(writer, key); err != nil {
-			file.Close()
+			closeQuietly(file)
 			_ = os.Remove(tmpPath)
 			return err
 		}
 	}
 	if err := writer.Flush(); err != nil {
-		file.Close()
+		closeQuietly(file)
 		_ = os.Remove(tmpPath)
 		return err
 	}

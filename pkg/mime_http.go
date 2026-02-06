@@ -17,7 +17,7 @@ func (r *RAria2) sniffHTTPContentType(workerId int, cUrl string) (string, bool) 
 			res, err = r.client().DoWithRetry(req)
 		}
 		if err == nil {
-			res.Body.Close()
+			closeQuietly(res.Body)
 			if res.StatusCode >= 200 && res.StatusCode < 300 {
 				contentType = res.Header.Get("Content-Type")
 			}
@@ -41,7 +41,7 @@ func (r *RAria2) sniffHTTPContentType(workerId int, cUrl string) (string, bool) 
 		if err != nil {
 			return "", false
 		}
-		defer sniffRes.Body.Close()
+		defer closeQuietly(sniffRes.Body)
 
 		if sniffRes.StatusCode >= 200 && sniffRes.StatusCode < 300 {
 			limitReader := io.LimitReader(sniffRes.Body, 1024)

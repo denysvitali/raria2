@@ -67,7 +67,7 @@ func (r *RAria2) getRobotsData(host string) (*robotstxt.RobotsData, error) {
 			return &robotsData, nil
 		}
 	}
-	defer resp.Body.Close()
+	defer closeQuietly(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		// No robots.txt or error fetching it

@@ -95,7 +95,7 @@ func TestUrlAllowedByRobots(t *testing.T) {
 					if r.URL.Path == "/robots.txt" {
 						w.Header().Set("Content-Type", "text/plain")
 						w.WriteHeader(http.StatusOK)
-						fmt.Fprint(w, tt.robotsContent)
+						_, _ = fmt.Fprint(w, tt.robotsContent)
 						return
 					}
 					w.WriteHeader(http.StatusNotFound)
@@ -168,7 +168,7 @@ func TestGetRobotsData(t *testing.T) {
 					w.WriteHeader(tt.statusCode)
 					if tt.statusCode == http.StatusOK {
 						w.Header().Set("Content-Type", "text/plain")
-						fmt.Fprint(w, tt.robotsContent)
+						_, _ = fmt.Fprint(w, tt.robotsContent)
 					}
 					return
 				}
@@ -224,7 +224,7 @@ func TestUrlAllowedByRobots_Caching(t *testing.T) {
 		if r.URL.Path == "/robots.txt" {
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, robotsContent)
+			_, _ = fmt.Fprint(w, robotsContent)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)

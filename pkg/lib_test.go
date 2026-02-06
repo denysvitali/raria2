@@ -221,9 +221,10 @@ func TestSubDownloadUrlsHTTPSkipsFileTastingWithoutMimeFilters(t *testing.T) {
 				t.Fatalf("unexpected method for index: %s", r.Method)
 			}
 		case "/root/file.bin":
-			if r.Method == http.MethodHead {
+			switch r.Method {
+			case http.MethodHead:
 				fileHeadCalls++
-			} else if r.Method == http.MethodGet {
+			case http.MethodGet:
 				fileGetCalls++
 			}
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -1101,7 +1102,7 @@ func writeVisitedCache(t *testing.T, path string, entries []string) {
 	if err != nil {
 		t.Fatalf("failed to create cache file: %v", err)
 	}
-	defer file.Close()
+	defer closeQuietly(file)
 	writer := bufio.NewWriter(file)
 	for _, entry := range entries {
 		if _, err := writer.WriteString(entry + "\n"); err != nil {

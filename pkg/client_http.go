@@ -58,7 +58,7 @@ func (c *HTTPClient) doWithRetry(req *http.Request, enableRetries bool) (*http.R
 	for attempt := 0; attempt < c.retryCount; attempt++ {
 		if attempt > 0 {
 			// Exponential backoff with jitter
-			delay := c.baseDelay * time.Duration(1<<uint(attempt-1))
+			delay := c.baseDelay * time.Duration(1<<(attempt-1))
 			jitter := time.Duration(float64(delay) * 0.1 * (0.5 + 0.5*rand.Float64()))
 			time.Sleep(delay + jitter)
 
@@ -72,7 +72,7 @@ func (c *HTTPClient) doWithRetry(req *http.Request, enableRetries bool) (*http.R
 			// Check for transient HTTP errors
 			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
 				lastErr = fmt.Errorf("HTTP %d: transient error", resp.StatusCode)
-				resp.Body.Close()
+				closeQuietly(resp.Body)
 				continue
 			}
 			return resp, nil
@@ -166,7 +166,7 @@ func (d *ContentTypeDetector) IsHTMLPage(urlString, userAgent string) (bool, err
 	if err != nil {
 		return false, err
 	}
-	defer res.Body.Close()
+	defer closeQuietly(res.Body)
 
 	// If HEAD fails with 405/403 or missing Content-Type, fall back to GET
 	if res.StatusCode == 405 || res.StatusCode == 403 ||
@@ -183,7 +183,7 @@ func (d *ContentTypeDetector) IsHTMLPage(urlString, userAgent string) (bool, err
 		if err != nil {
 			return false, err
 		}
-		defer res.Body.Close()
+		defer closeQuietly(res.Body)
 
 		// If Range not supported, read first 1KB normally
 		if res.StatusCode == 416 || res.StatusCode == 400 {
@@ -196,7 +196,7 @@ func (d *ContentTypeDetector) IsHTMLPage(urlString, userAgent string) (bool, err
 			if err != nil {
 				return false, err
 			}
-			defer res.Body.Close()
+			defer closeQuietly(res.Body)
 		}
 
 		// For successful GET (either Range or full), read first 1KB to detect content type

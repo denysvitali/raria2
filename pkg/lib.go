@@ -633,7 +633,7 @@ func (r *RAria2) writeBatchFile(content []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to create batch file %s: %w", r.WriteBatch, err)
 	}
-	defer file.Close()
+	defer closeQuietly(file)
 
 	if _, err := file.Write(content); err != nil {
 		return fmt.Errorf("failed to write batch file %s: %w", r.WriteBatch, err)

@@ -29,7 +29,7 @@ func (r *RAria2) IsHtmlPage(urlString string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer res.Body.Close()
+	defer closeQuietly(res.Body)
 
 	// If HEAD fails with 405/403 or missing Content-Type, fall back to GET
 	if res.StatusCode == 405 || res.StatusCode == 403 ||
@@ -50,7 +50,7 @@ func (r *RAria2) IsHtmlPage(urlString string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		defer res.Body.Close()
+		defer closeQuietly(res.Body)
 
 		// If Range not supported, read first 1KB normally
 		if res.StatusCode == 416 || res.StatusCode == 400 {
@@ -67,7 +67,7 @@ func (r *RAria2) IsHtmlPage(urlString string) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			defer res.Body.Close()
+			defer closeQuietly(res.Body)
 		}
 
 		// For successful GET (either Range or full), read first 1KB to detect content type
@@ -129,7 +129,7 @@ func (r *RAria2) getLinksByUrlWithContext(ctx context.Context, urlString string)
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	defer closeQuietly(res.Body)
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("unexpected status code %d for %s", res.StatusCode, urlString)
